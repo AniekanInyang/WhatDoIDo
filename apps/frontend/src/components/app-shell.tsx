@@ -8,31 +8,33 @@ export function AppShell({ children }: PropsWithChildren) {
   const pathname = usePathname();
   const isLanding = pathname === "/";
   const isConversation = pathname === "/decision/conversation";
+  const isAuth = pathname === "/auth";
+  const showPrimaryNav = !isLanding && !isAuth;
+  const showStart = (isLanding || !isConversation) && !isAuth;
 
   const nav = [
-    { href: "/", label: "Home" },
-    { href: "/decision/conversation", label: "New" },
-    { href: "/history", label: "History" },
-    { href: "/insights", label: "Insights" },
-    { href: "/settings", label: "Settings" },
+    { href: "/", label: "Home", requiresAuth: false },
+    { href: "/decision/conversation", label: "New", requiresAuth: false },
+    { href: "/history", label: "History", requiresAuth: true },
+    { href: "/insights", label: "Insights", requiresAuth: true },
+    { href: "/settings", label: "Settings", requiresAuth: true },
   ];
 
   return (
-    <div className="min-h-screen px-4 py-6 md:px-6 lg:px-8">
-      <header className="entry surface-card mx-auto mb-4 flex w-full max-w-6xl flex-col gap-4 p-4 md:flex-row md:items-center md:justify-between">
-        <div className="text-center md:text-left">
-          <p className="text-[11px] uppercase tracking-[0.18em] text-brand-muted">Decision Intelligence</p>
-          <h1 className="headline mt-1 text-xl font-semibold text-brand-text">WhatDoIDo</h1>
+    <div className="min-h-screen px-3 py-4 sm:px-4 md:px-6 lg:px-8">
+      <header className="entry surface-card mx-auto mb-5 flex w-full max-w-6xl flex-col gap-4 p-4 md:flex-row md:items-center md:justify-between">
+        <div>
+          <h1 className="headline text-xl font-semibold text-brand-text">What Do I Do?</h1>
         </div>
-        <div className="flex flex-wrap items-center justify-center gap-2 md:justify-end">
-          {!isLanding &&
+        <nav className="flex w-full items-center gap-2 overflow-x-auto pb-1 md:w-auto md:flex-wrap md:justify-end md:overflow-visible md:pb-0">
+          {showPrimaryNav &&
             nav.map((item) => {
               const active = pathname === item.href;
               return (
                 <Link
                   key={item.href}
-                  href={item.href}
-                  className={`rounded-full px-3 py-1.5 text-xs transition ${
+                  href={item.requiresAuth ? "/auth" : item.href}
+                  className={`shrink-0 rounded-lg px-3 py-2 text-xs font-medium transition ${
                     active
                       ? "bg-brand-primary text-white"
                       : "pill hover:border-brand-accent hover:text-brand-text"
@@ -43,10 +45,10 @@ export function AppShell({ children }: PropsWithChildren) {
               );
             })}
 
-          {(isLanding || !isConversation) && (
+          {showStart && (
             <Link
               href="/decision/conversation"
-              className="rounded-full bg-brand-primary px-3.5 py-1.5 text-xs font-medium text-white transition hover:bg-brand-hover"
+              className="shrink-0 rounded-lg bg-brand-primary px-3.5 py-2 text-xs font-medium text-white transition hover:bg-brand-hover"
             >
               Start
             </Link>
@@ -55,17 +57,17 @@ export function AppShell({ children }: PropsWithChildren) {
           {isLanding && (
             <Link
               href="/auth"
-              className="pill rounded-full px-3.5 py-1.5 text-xs transition hover:text-brand-text"
+              className="pill shrink-0 rounded-lg px-3.5 py-2 text-xs font-medium transition hover:text-brand-text"
             >
-              Sign In
+              View History
             </Link>
           )}
-          {!isLanding && isConversation && (
-            <Link href="/" className="pill rounded-full px-3.5 py-1.5 text-xs transition hover:text-brand-text">
+          {isAuth && (
+            <Link href="/" className="pill shrink-0 rounded-lg px-3.5 py-2 text-xs font-medium transition hover:text-brand-text">
               Home
             </Link>
           )}
-        </div>
+        </nav>
       </header>
 
       <main className="entry mx-auto w-full max-w-6xl pb-8">{children}</main>

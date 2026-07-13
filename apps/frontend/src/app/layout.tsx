@@ -6,7 +6,7 @@ import "./globals.css";
 const space = Space_Grotesk({ subsets: ["latin"], variable: "--font-space" });
 
 export const metadata: Metadata = {
-  title: "WhatDoIDo",
+  title: "What Do I Do?",
   description: "Production-ready AI decision support UI",
 };
 

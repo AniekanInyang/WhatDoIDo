@@ -16,7 +16,7 @@ export default function CollectionsPage() {
           <article key={collection.name} className="surface-card p-5">
             <h3 className="text-base font-semibold text-brand-text">{collection.name}</h3>
             <p className="mt-1 text-xs text-brand-muted">{collection.decisions} decisions</p>
-            <p className="mt-3 inline-flex rounded-full bg-brand-soft px-3 py-1 text-xs text-brand-text">{collection.trend}</p>
+            <p className="mt-3 inline-flex rounded-lg bg-brand-soft px-3 py-1 text-xs text-brand-text">{collection.trend}</p>
           </article>
         ))}
       </div>
