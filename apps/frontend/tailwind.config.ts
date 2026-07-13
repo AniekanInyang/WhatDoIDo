@@ -15,6 +15,8 @@ const config: Config = {
 					border: "#E8D8F0",
 					surface: "#FFFFFF",
 					soft: "#F7F0FB",
+					success: "#287A5A",
+					warning: "#A15F16",
 				},
 			},
 			boxShadow: {

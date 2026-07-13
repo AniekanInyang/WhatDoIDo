@@ -16,7 +16,7 @@ export default function DecisionDetailPage() {
       <article className="surface-card p-5">
         <div className="grid gap-3">
           {timeline.map((item, index) => (
-            <div key={item.step} className="flex gap-3 rounded-xl border border-brand-border bg-brand-soft p-3">
+            <div key={item.step} className="surface-panel flex gap-3 p-3">
               <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-brand-primary text-sm font-semibold text-white">
                 {index + 1}
               </div>
