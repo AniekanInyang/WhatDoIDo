@@ -34,11 +34,17 @@ export async function signUp(formData: FormData) {
     options: { data: { display_name: name } },
   });
 
-  if (error) authRedirect(error.message);
+  if (error) {
+    redirect(`/auth/sign-up?error=${encodeURIComponent(error.message)}`);
+  }
   if (!data.session) {
     authRedirect("Check your email to confirm your account.", "message");
   }
-  redirect("/history");
+
+  // Email confirmation is disabled, so Supabase creates a session during
+  // signup. This product keeps registration and login as separate actions.
+  await supabase.auth.signOut();
+  authRedirect("Account created. Sign in to continue.", "message");
 }
 
 export async function signOut() {
@@ -55,8 +61,10 @@ export async function requestPasswordReset(formData: FormData) {
     redirectTo: `${origin ?? "http://localhost:3000"}/auth/callback?next=/auth/update-password`,
   });
 
-  if (error) authRedirect(error.message);
-  authRedirect("If an account exists, a password reset link has been sent.", "message");
+  if (error) {
+    redirect(`/auth/forgot-password?error=${encodeURIComponent(error.message)}`);
+  }
+  redirect("/auth/forgot-password?message=If%20an%20account%20exists%2C%20a%20password%20reset%20link%20has%20been%20sent.");
 }
 
 export async function updatePassword(formData: FormData) {

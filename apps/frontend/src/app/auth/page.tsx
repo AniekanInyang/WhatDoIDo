@@ -1,12 +1,13 @@
 import { PageHeader } from "@/components/page-header";
 import { AuthInput } from "@/components/auth-input";
-import { requestPasswordReset, signIn, signUp } from "./actions";
+import Link from "next/link";
+import { signIn } from "./actions";
 
 type AuthPageProps = { searchParams: { error?: string; message?: string; next?: string } };
 
 export default function AuthPage({ searchParams }: AuthPageProps) {
   return (
-    <section>
+    <section className="mx-auto max-w-2xl">
       <PageHeader eyebrow="Auth" title="Sign in" subtitle="Access your workspace" />
 
       {(searchParams.error || searchParams.message) && (
@@ -15,39 +16,31 @@ export default function AuthPage({ searchParams }: AuthPageProps) {
         </p>
       )}
 
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div className="grid gap-4">
         <form action={signIn} className="surface-card p-5">
           <h3 className="text-base font-semibold text-brand-text">Sign In</h3>
           <div className="mt-3 grid gap-2 text-sm">
             <AuthInput id="sign-in-email" name="email" placeholder="Email" type="email" autoComplete="email" nextId="sign-in-password" />
             <AuthInput id="sign-in-password" name="password" placeholder="Password" type="password" autoComplete="current-password" />
+            <div className="text-right">
+              <Link className="text-sm font-medium text-brand-primary hover:underline" href="/auth/forgot-password">
+                Forgot your password?
+              </Link>
+            </div>
             <input name="next" type="hidden" value={searchParams.next ?? ""} />
             <button className="rounded-lg bg-brand-primary px-4 py-2 font-medium text-white hover:bg-brand-hover">
               Continue
             </button>
           </div>
-        </form>
-
-        <form action={signUp} className="surface-card p-5">
-          <h3 className="text-base font-semibold text-brand-text">Create Account</h3>
-          <div className="mt-3 grid gap-2 text-sm">
-            <AuthInput id="sign-up-name" name="name" placeholder="Name" type="text" autoComplete="name" nextId="sign-up-email" />
-            <AuthInput id="sign-up-email" name="email" placeholder="Email" type="email" autoComplete="email" nextId="sign-up-password" />
-            <AuthInput id="sign-up-password" name="password" placeholder="Password (8+ characters)" type="password" minLength={8} autoComplete="new-password" />
-            <button className="rounded-lg border border-brand-border bg-brand-soft px-4 py-2 font-medium text-brand-text hover:border-brand-accent">
-              Create
-            </button>
-          </div>
+          <p className="mt-4 text-sm text-brand-muted">
+            Don&apos;t have an account?{" "}
+            <Link className="font-medium text-brand-primary hover:underline" href="/auth/sign-up">
+              Create an account
+            </Link>
+          </p>
         </form>
       </div>
 
-      <form action={requestPasswordReset} className="surface-card mt-4 flex flex-col gap-2 p-5 sm:flex-row sm:items-end">
-        <label className="grid flex-1 gap-2 text-sm font-medium text-brand-text">
-          Forgot your password?
-          <input name="email" className="field p-3 font-normal" placeholder="Email" type="email" required autoComplete="email" />
-        </label>
-        <button className="rounded-lg border border-brand-border bg-brand-soft px-4 py-3 text-sm font-medium text-brand-text hover:border-brand-accent">Send reset link</button>
-      </form>
     </section>
   );
 }

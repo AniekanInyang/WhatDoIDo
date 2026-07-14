@@ -10,13 +10,11 @@ type AppShellProps = PropsWithChildren<{ userEmail?: string }>;
 export function AppShell({ children, userEmail }: AppShellProps) {
   const pathname = usePathname();
   const isLanding = pathname === "/";
-  const isConversation = pathname === "/decision/conversation";
-  const isAuth = pathname === "/auth";
+  const isAuth = pathname.startsWith("/auth");
   const showPrimaryNav = !isLanding && !isAuth;
-  const showStart = (isLanding || !isConversation) && !isAuth;
+  const showStart = isLanding;
 
   const nav = [
-    { href: "/", label: "Home", requiresAuth: false },
     { href: "/decision/conversation", label: "New", requiresAuth: false },
     { href: "/history", label: "History", requiresAuth: true },
     { href: "/insights", label: "Insights", requiresAuth: true },
@@ -26,9 +24,9 @@ export function AppShell({ children, userEmail }: AppShellProps) {
   return (
     <div className="min-h-screen px-3 py-4 sm:px-4 md:px-6 lg:px-8">
       <header className="entry surface-card mx-auto mb-5 flex w-full max-w-6xl flex-col gap-4 p-4 md:flex-row md:items-center md:justify-between">
-        <div>
+        <Link href="/" className="rounded-md focus:outline-none focus:ring-2 focus:ring-brand-primary focus:ring-offset-2">
           <h1 className="headline text-xl font-semibold text-brand-text">What Do I Do?</h1>
-        </div>
+        </Link>
         <nav className="flex w-full items-center gap-2 overflow-x-auto pb-1 md:w-auto md:flex-wrap md:justify-end md:overflow-visible md:pb-0">
           {showPrimaryNav &&
             nav.map((item) => {
