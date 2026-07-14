@@ -3,8 +3,11 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { PropsWithChildren } from "react";
+import { signOut } from "@/app/auth/actions";
 
-export function AppShell({ children }: PropsWithChildren) {
+type AppShellProps = PropsWithChildren<{ userEmail?: string }>;
+
+export function AppShell({ children, userEmail }: AppShellProps) {
   const pathname = usePathname();
   const isLanding = pathname === "/";
   const isConversation = pathname === "/decision/conversation";
@@ -33,7 +36,7 @@ export function AppShell({ children }: PropsWithChildren) {
               return (
                 <Link
                   key={item.href}
-                  href={item.requiresAuth ? "/auth" : item.href}
+                  href={item.requiresAuth && !userEmail ? `/auth?next=${item.href}` : item.href}
                   className={`shrink-0 rounded-lg px-3 py-2 text-xs font-medium transition ${
                     active
                       ? "bg-brand-primary text-white"
@@ -66,6 +69,13 @@ export function AppShell({ children }: PropsWithChildren) {
             <Link href="/" className="pill shrink-0 rounded-lg px-3.5 py-2 text-xs font-medium transition hover:text-brand-text">
               Home
             </Link>
+          )}
+          {userEmail && !isAuth && (
+            <form action={signOut} className="shrink-0">
+              <button className="pill rounded-lg px-3.5 py-2 text-xs font-medium transition hover:text-brand-text" title={userEmail}>
+                Sign out
+              </button>
+            </form>
           )}
         </nav>
       </header>
