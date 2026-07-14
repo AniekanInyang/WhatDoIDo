@@ -1,0 +1,103 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-primary: #51245f;
+  --color-primary-hover: #3f194d;
+  --color-accent: #8f5ba4;
+  --color-bg: #fbf9fc;
+  --color-surface: #ffffff;
+  --color-surface-soft: #f6f2f8;
+  --color-text: #24152c;
+  --color-text-muted: #6d6074;
+  --color-border: #e7ddeb;
+  --color-success: #287a5a;
+  --color-warning: #a15f16;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: radial-gradient(circle at 10% -10%, rgba(90, 42, 106, 0.1), transparent 40%),
+    radial-gradient(circle at 88% 12%, rgba(162, 108, 181, 0.08), transparent 34%),
+    var(--color-bg);
+  color: var(--color-text);
+}
+
+body {
+  font-family: var(--font-space), ui-sans-serif, system-ui;
+  font-size: 15px;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.surface-card {
+  border: 1px solid var(--color-border);
+  background: var(--color-surface);
+  border-radius: 8px;
+  box-shadow: 0 12px 34px rgba(31, 20, 38, 0.07);
+}
+
+.surface-panel {
+  border: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-surface) 88%, transparent);
+  border-radius: 8px;
+}
+
+.headline {
+  letter-spacing: 0;
+}
+
+.pill {
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-surface-soft);
+  color: var(--color-text-muted);
+}
+
+.field {
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-surface);
+  color: var(--color-text);
+  outline: none;
+}
+
+.field:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 3px rgba(143, 91, 164, 0.16);
+}
+
+.entry {
+  opacity: 0;
+  transform: translateY(12px);
+  animation: slide-in 520ms ease forwards;
+}
+
+.stagger-1 {
+  animation-delay: 100ms;
+}
+
+.stagger-2 {
+  animation-delay: 170ms;
+}
+
+.stagger-3 {
+  animation-delay: 240ms;
+}
+
+@keyframes slide-in {
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
