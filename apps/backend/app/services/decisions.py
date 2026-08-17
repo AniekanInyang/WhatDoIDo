@@ -1,3 +1,6 @@
+import base64
+import json
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -9,7 +12,9 @@ from app.core.config import Settings
 from app.models.decision import (
     ConversationTurn,
     DecisionCreate,
+    DecisionCollectionUpdate,
     DecisionDetail,
+    DecisionPage,
     DecisionMessage,
     DecisionMessageCreate,
     DecisionSummary,
@@ -45,6 +50,7 @@ class DecisionStore:
         json: dict[str, Any] | None = None,
         prefer_representation: bool = False,
         trusted_backend: bool = False,
+        prefer: str | None = None,
     ) -> list[dict[str, Any]]:
         headers = self.headers.copy()
         if trusted_backend:
@@ -56,8 +62,13 @@ class DecisionStore:
             service_key = self.settings.supabase_service_role_key.get_secret_value()
             headers["apikey"] = service_key
             headers["Authorization"] = f"Bearer {service_key}"
+        preferences = []
         if prefer_representation:
-            headers["Prefer"] = "return=representation"
+            preferences.append("return=representation")
+        if prefer:
+            preferences.append(prefer)
+        if preferences:
+            headers["Prefer"] = ",".join(preferences)
 
         try:
             response = await client.request(
@@ -163,18 +174,55 @@ class DecisionStore:
             assistant_message=assistant_message,
         )
 
-    async def list(self) -> list[DecisionSummary]:
+    @staticmethod
+    def _encode_cursor(updated_at: datetime, decision_id: UUID) -> str:
+        raw = json.dumps({"updated_at": updated_at.isoformat(), "id": str(decision_id)}).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    @staticmethod
+    def _decode_cursor(cursor: str | None) -> tuple[str | None, str | None]:
+        if not cursor:
+            return None, None
+        try:
+            padded = cursor + "=" * (-len(cursor) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded).decode())
+            return str(datetime.fromisoformat(payload["updated_at"]).isoformat()), str(UUID(payload["id"]))
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid pagination cursor") from exc
+
+    async def list(
+        self,
+        *,
+        search: str | None = None,
+        collection_id: UUID | None = None,
+        uncategorized: bool = False,
+        trash: bool = False,
+        cursor: str | None = None,
+        limit: int = 20,
+    ) -> DecisionPage:
+        cursor_updated_at, cursor_id = self._decode_cursor(cursor)
         async with httpx.AsyncClient(timeout=10.0) as client:
             rows = await self._request(
                 client,
-                "GET",
-                "decisions",
-                params={
-                    "select": "id,title,prompt,status,created_at,updated_at",
-                    "order": "updated_at.desc",
+                "POST",
+                "rpc/search_user_decisions",
+                json={
+                    "p_search": search,
+                    "p_collection_id": str(collection_id) if collection_id else None,
+                    "p_uncategorized": uncategorized,
+                    "p_trash": trash,
+                    "p_cursor_updated_at": cursor_updated_at,
+                    "p_cursor_id": cursor_id,
+                    "p_limit": limit + 1,
                 },
             )
-        return [DecisionSummary.model_validate(row) for row in rows]
+        has_more = len(rows) > limit
+        items = [DecisionSummary.model_validate(row) for row in rows[:limit]]
+        next_cursor = None
+        if has_more and items:
+            last = items[-1]
+            next_cursor = self._encode_cursor(last.updated_at, last.id)
+        return DecisionPage(items=items, next_cursor=next_cursor)
 
     async def get(self, decision_id: UUID) -> DecisionDetail:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -228,3 +276,75 @@ class DecisionStore:
         if not rows:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Decision not found")
         return DecisionSummary.model_validate(rows[0])
+
+    async def set_collection(self, decision_id: UUID, values: DecisionCollectionUpdate) -> None:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Confirm ownership of the decision before changing its organization.
+            decisions = await self._request(
+                client, "GET", "decisions", params={"id": f"eq.{decision_id}", "select": "id", "limit": "1"}
+            )
+            if not decisions:
+                raise HTTPException(status_code=404, detail="Decision not found")
+
+            if values.collection_id is None:
+                await self._request(
+                    client, "DELETE", "collection_decisions", params={"decision_id": f"eq.{decision_id}"}
+                )
+                return
+
+            collections = await self._request(
+                client,
+                "GET",
+                "collections",
+                params={"id": f"eq.{values.collection_id}", "select": "id", "limit": "1"},
+            )
+            if not collections:
+                raise HTTPException(status_code=404, detail="Collection not found")
+            await self._request(
+                client,
+                "POST",
+                "collection_decisions",
+                params={"on_conflict": "decision_id"},
+                json={"decision_id": str(decision_id), "collection_id": str(values.collection_id)},
+                prefer="resolution=merge-duplicates",
+            )
+
+    async def trash(self, decision_id: UUID) -> DecisionSummary:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            rows = await self._request(
+                client,
+                "PATCH",
+                "decisions",
+                params={"id": f"eq.{decision_id}", "deleted_at": "is.null"},
+                json={"deleted_at": datetime.now().astimezone().isoformat()},
+                prefer_representation=True,
+            )
+        if not rows:
+            raise HTTPException(status_code=404, detail="Decision not found")
+        return DecisionSummary.model_validate(rows[0])
+
+    async def restore(self, decision_id: UUID) -> DecisionSummary:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            rows = await self._request(
+                client,
+                "PATCH",
+                "decisions",
+                params={"id": f"eq.{decision_id}", "deleted_at": "not.is.null"},
+                json={"deleted_at": None},
+                prefer_representation=True,
+            )
+        if not rows:
+            raise HTTPException(status_code=404, detail="Trashed decision not found")
+        return DecisionSummary.model_validate(rows[0])
+
+    async def permanently_delete(self, decision_id: UUID) -> None:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            rows = await self._request(
+                client,
+                "GET",
+                "decisions",
+                params={"id": f"eq.{decision_id}", "deleted_at": "not.is.null", "select": "id", "limit": "1"},
+            )
+            if not rows:
+                raise HTTPException(status_code=404, detail="Trashed decision not found")
+            await self._request(client, "DELETE", "decisions", params={"id": f"eq.{decision_id}"})

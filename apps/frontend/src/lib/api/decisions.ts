@@ -8,6 +8,19 @@ export type DecisionSummary = {
   status: string;
   created_at: string;
   updated_at: string;
+  deleted_at: string | null;
+  collection_id: string | null;
+  collection_name: string | null;
+};
+
+export type DecisionPage = { items: DecisionSummary[]; next_cursor: string | null };
+
+export type Collection = {
+  id: string;
+  user_id: string;
+  name: string;
+  created_at: string;
+  updated_at: string;
 };
 
 export type DecisionOption = {
@@ -72,8 +85,20 @@ export async function authenticatedFetch<T>(path: string, init?: RequestInit, ne
   return response.json() as Promise<T>;
 }
 
-export function listDecisions() {
-  return authenticatedFetch<DecisionSummary[]>("/decisions");
+export function listDecisions(filters: {
+  q?: string;
+  collectionId?: string;
+  uncategorized?: boolean;
+  trash?: boolean;
+  cursor?: string;
+} = {}) {
+  const params = new URLSearchParams();
+  if (filters.q) params.set("q", filters.q);
+  if (filters.collectionId) params.set("collection_id", filters.collectionId);
+  if (filters.uncategorized) params.set("uncategorized", "true");
+  if (filters.trash) params.set("trash", "true");
+  if (filters.cursor) params.set("cursor", filters.cursor);
+  return authenticatedFetch<DecisionPage>(`/decisions?${params.toString()}`);
 }
 
 export function getDecision(id: string) {
@@ -100,4 +125,45 @@ export function renameDecision(id: string, title: string) {
     method: "PATCH",
     body: JSON.stringify({ title }),
   });
+}
+
+export function listCollections() {
+  return authenticatedFetch<Collection[]>("/collections");
+}
+
+export function createCollection(name: string) {
+  return authenticatedFetch<Collection>("/collections", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+}
+
+export function renameCollection(id: string, name: string) {
+  return authenticatedFetch<Collection>(`/collections/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ name }),
+  });
+}
+
+export function deleteCollection(id: string) {
+  return authenticatedFetch<void>(`/collections/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export function moveDecision(id: string, collectionId: string | null) {
+  return authenticatedFetch<void>(`/decisions/${encodeURIComponent(id)}/collection`, {
+    method: "PUT",
+    body: JSON.stringify({ collection_id: collectionId }),
+  });
+}
+
+export function trashDecision(id: string) {
+  return authenticatedFetch<DecisionSummary>(`/decisions/${encodeURIComponent(id)}/trash`, { method: "POST" });
+}
+
+export function restoreDecision(id: string) {
+  return authenticatedFetch<DecisionSummary>(`/decisions/${encodeURIComponent(id)}/restore`, { method: "POST" });
+}
+
+export function permanentlyDeleteDecision(id: string) {
+  return authenticatedFetch<void>(`/decisions/${encodeURIComponent(id)}`, { method: "DELETE" });
 }

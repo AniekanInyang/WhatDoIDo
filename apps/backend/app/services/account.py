@@ -83,6 +83,8 @@ class AccountService:
             options = await self._rows(client, "decision_options", params={"select": "*", "order": "created_at.asc"})
             messages = await self._rows(client, "decision_messages", params={"select": "*", "order": "created_at.asc"})
             evaluations = await self._rows(client, "evaluations", params={"select": "*", "order": "created_at.asc"})
+            collections = await self._rows(client, "collections", params={"select": "*", "order": "created_at.asc"})
+            collection_decisions = await self._rows(client, "collection_decisions", params={"select": "*", "order": "added_at.asc"})
         return DataExport(
             exported_at=datetime.now(UTC).isoformat(),
             account={
@@ -96,6 +98,8 @@ class AccountService:
             decision_options=options,
             decision_messages=messages,
             evaluations=evaluations,
+            collections=collections,
+            collection_decisions=collection_decisions,
         )
 
     async def delete(self, values: AccountDeletion) -> None:

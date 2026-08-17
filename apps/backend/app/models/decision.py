@@ -20,6 +20,18 @@ class DecisionSummary(BaseModel):
     status: str
     created_at: datetime
     updated_at: datetime
+    deleted_at: datetime | None = None
+    collection_id: UUID | None = None
+    collection_name: str | None = None
+
+
+class DecisionPage(BaseModel):
+    items: list[DecisionSummary]
+    next_cursor: str | None = None
+
+
+class DecisionCollectionUpdate(BaseModel):
+    collection_id: UUID | None = None
 
 
 class DecisionOption(BaseModel):
