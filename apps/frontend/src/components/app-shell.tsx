@@ -55,9 +55,9 @@ export function AppShell({ children, userEmail }: AppShellProps) {
             </Link>
           )}
 
-          {isLanding && (
+          {isLanding && userEmail && (
             <Link
-              href="/auth"
+              href="/history"
               className="pill shrink-0 rounded-lg px-3.5 py-2 text-xs font-medium transition hover:text-brand-text"
             >
               View History
