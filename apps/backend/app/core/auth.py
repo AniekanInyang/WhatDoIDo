@@ -15,6 +15,8 @@ class AuthenticatedUser(BaseModel):
     role: str | None = None
     user_metadata: dict[str, Any] = Field(default_factory=dict)
     app_metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str | None = None
+    last_sign_in_at: str | None = None
     access_token: str = Field(exclude=True, repr=False)
 
 

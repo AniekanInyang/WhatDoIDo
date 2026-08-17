@@ -45,7 +45,7 @@ function apiUrl() {
   return process.env.API_URL ?? process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 }
 
-async function authenticatedFetch<T>(path: string, init?: RequestInit, next = "/history"): Promise<T> {
+export async function authenticatedFetch<T>(path: string, init?: RequestInit, next = "/history"): Promise<T> {
   const supabase = createClient();
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) redirect(`/auth?next=${encodeURIComponent(next)}`);
@@ -68,6 +68,7 @@ async function authenticatedFetch<T>(path: string, init?: RequestInit, next = "/
     const body = await response.json().catch(() => null);
     throw new Error(body?.detail ?? "The decision service request failed.");
   }
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
