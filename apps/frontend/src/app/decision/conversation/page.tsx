@@ -1,4 +1,6 @@
 import { PageHeader } from "@/components/page-header";
+import { ConversationComposer } from "@/components/conversation-composer";
+import { startDecision } from "./actions";
 
 export default function DecisionConversationPage() {
   return (
@@ -25,15 +27,7 @@ export default function DecisionConversationPage() {
               </p>
             </div>
           </div>
-          <div className="mt-3 flex gap-2">
-            <input
-              className="field min-w-0 flex-1 p-3 text-sm"
-              placeholder="Example: Should I accept the startup offer or stay where I am?"
-            />
-            <button className="rounded-lg bg-brand-primary px-4 py-2.5 text-sm font-medium text-white hover:bg-brand-hover">
-              Send
-            </button>
-          </div>
+          <ConversationComposer action={startDecision} />
         </article>
 
         <aside className="surface-card p-5">
