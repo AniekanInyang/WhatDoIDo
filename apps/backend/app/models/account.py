@@ -36,3 +36,5 @@ class DataExport(BaseModel):
     decision_options: list[dict[str, Any]]
     decision_messages: list[dict[str, Any]]
     evaluations: list[dict[str, Any]]
+    collections: list[dict[str, Any]]
+    collection_decisions: list[dict[str, Any]]
