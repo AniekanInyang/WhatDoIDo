@@ -6,6 +6,7 @@ from uuid import UUID
 
 import httpx
 from fastapi import HTTPException, status
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from app.core.auth import AuthenticatedUser
 from app.core.config import Settings
@@ -17,10 +18,17 @@ from app.models.decision import (
     DecisionPage,
     DecisionMessage,
     DecisionMessageCreate,
+    DecisionOption,
+    DecisionOptionCreate,
+    DecisionOptionUpdate,
+    DecisionOptionStatusUpdate,
+    DecisionStateItemReview,
+    ContradictionResolution,
     DecisionSummary,
     DecisionTitleUpdate,
 )
-from app.llm.decision_assistant import generate_assistant_reply
+from app.graph.state import ClarificationProfile, PolicyActionStats
+from app.graph.workflow import _same_option, build_decision_graph
 
 
 class DecisionStore:
@@ -115,12 +123,7 @@ class DecisionStore:
             user_message = await self._insert_message(
                 client, decision.id, "user", values.prompt, trusted_backend=False
             )
-            reply = await generate_assistant_reply(
-                [{"role": "user", "content": user_message.content}], self.settings
-            )
-            await self._insert_message(
-                client, decision.id, "assistant", reply, trusted_backend=True
-            )
+            await self._run_conversation_turn(client, decision.id, user_message, {}, [])
         return decision
 
     @staticmethod
@@ -140,12 +143,18 @@ class DecisionStore:
         content: str,
         *,
         trusted_backend: bool,
+        structured_data: dict[str, Any] | None = None,
     ) -> DecisionMessage:
         rows = await self._request(
             client,
             "POST",
             "decision_messages",
-            json={"decision_id": str(decision_id), "role": role, "content": content},
+            json={
+                "decision_id": str(decision_id),
+                "role": role,
+                "content": content,
+                "structured_data": structured_data or {},
+            },
             prefer_representation=True,
             trusted_backend=trusted_backend,
         )
@@ -155,24 +164,490 @@ class DecisionStore:
         self, decision_id: UUID, values: DecisionMessageCreate
     ) -> ConversationTurn:
         decision = await self.get(decision_id)
+        if decision.status == "completed":
+            raise HTTPException(
+                status_code=409,
+                detail="Completed decisions are read-only; only the title can be changed",
+            )
         async with httpx.AsyncClient(timeout=10.0) as client:
             user_message = await self._insert_message(
                 client, decision_id, "user", values.content, trusted_backend=False
             )
-            history = [
-                {"role": message.role, "content": message.content}
-                for message in decision.messages
-                if message.role in ("user", "assistant")
-            ]
-            history.append({"role": "user", "content": user_message.content})
-            reply = await generate_assistant_reply(history[-20:], self.settings)
-            assistant_message = await self._insert_message(
-                client, decision_id, "assistant", reply, trusted_backend=True
+            assistant_message = await self._run_conversation_turn(
+                client,
+                decision_id,
+                user_message,
+                decision.decision_brief,
+                [option.model_dump(mode="json") for option in decision.options],
             )
         return ConversationTurn(
             user_message=user_message,
             assistant_message=assistant_message,
         )
+
+    async def _load_policy_profile(self, client: httpx.AsyncClient) -> ClarificationProfile:
+        rows = await self._request(
+            client,
+            "GET",
+            "clarification_profiles",
+            params={"user_id": f"eq.{self.user.id}", "select": "profile", "limit": "1"},
+            trusted_backend=True,
+        )
+        return ClarificationProfile.model_validate(rows[0]["profile"] if rows else {})
+
+    async def _learn_from_previous_question(
+        self,
+        client: httpx.AsyncClient,
+        decision_id: UUID,
+        response: str,
+        profile: ClarificationProfile,
+    ) -> ClarificationProfile:
+        rows = await self._request(
+            client,
+            "GET",
+            "clarification_events",
+            params={
+                "user_id": f"eq.{self.user.id}",
+                "decision_id": f"eq.{decision_id}",
+                "outcome": "is.null",
+                "select": "id,action_category",
+                "order": "created_at.desc",
+                "limit": "1",
+            },
+            trusted_backend=True,
+        )
+        if not rows:
+            return profile
+
+        skipped_words = {"skip", "pass", "not sure", "i don't know", "idk"}
+        normalized = " ".join(response.lower().strip().split())
+        skipped = normalized in skipped_words
+        reward = -0.5 if skipped else 1.0
+        category = rows[0]["action_category"]
+        stats = profile.action_stats.setdefault(category, PolicyActionStats())
+        stats.skipped += int(skipped)
+        stats.answered += int(not skipped)
+        stats.reward_sum += reward
+        profile.total_interactions += 1
+        await self._request(
+            client,
+            "PATCH",
+            "clarification_events",
+            params={"id": f"eq.{rows[0]['id']}", "user_id": f"eq.{self.user.id}"},
+            json={"outcome": "skipped" if skipped else "answered", "reward": reward},
+            trusted_backend=True,
+        )
+        return profile
+
+    async def _save_policy_profile(
+        self, client: httpx.AsyncClient, profile: ClarificationProfile
+    ) -> None:
+        existing = await self._request(
+            client,
+            "GET",
+            "decision_state_events",
+            params={
+                "decision_id": f"eq.{decision_id}",
+                "revision": f"eq.{revision}",
+                "event_type": f"eq.{event_type}",
+                "select": "id",
+                "limit": "1",
+            },
+            trusted_backend=True,
+        )
+        if existing:
+            return
+        await self._request(
+            client,
+            "POST",
+            "clarification_profiles",
+            params={"on_conflict": "user_id"},
+            json={"user_id": str(self.user.id), "profile": profile.model_dump(mode="json")},
+            trusted_backend=True,
+            prefer="resolution=merge-duplicates",
+        )
+
+    async def _run_conversation_turn(
+        self,
+        client: httpx.AsyncClient,
+        decision_id: UUID,
+        user_message: DecisionMessage,
+        brief: dict[str, Any],
+        options: list[dict[str, Any]],
+    ) -> DecisionMessage:
+        profile = await self._load_policy_profile(client)
+        profile = await self._learn_from_previous_question(
+            client, decision_id, user_message.content, profile
+        )
+        await self._save_policy_profile(client, profile)
+        payload = {
+                "decision_id": str(decision_id),
+                "user_id": str(self.user.id),
+                "user_message": user_message.content,
+                "message_id": str(user_message.id),
+                "brief": brief,
+                "existing_options": options,
+                "profile": profile.model_dump(mode="json"),
+                "recommendation": {},
+                "recommendation_error": "",
+            }
+        try:
+            result = await self._invoke_graph(decision_id, payload)
+        except Exception:
+            await self._record_state_event(
+                client, decision_id, "workflow_failed", int(brief.get("revision", 0)),
+                {"message_id": str(user_message.id), "retryable": True},
+            )
+            return await self._insert_message(
+                client, decision_id, "assistant",
+                "The workflow was interrupted after retrying. Your progress is saved at the failed stage; use Retry workflow to continue.",
+                trusted_backend=True,
+                structured_data={"workflow_error": "retryable", "retry_available": True},
+            )
+        try:
+            return await self._persist_graph_result(
+                client, decision_id, user_message, options, profile, result
+            )
+        except Exception:
+            return await self._insert_message(
+                client, decision_id, "assistant",
+                "The workflow finished, but saving its result was interrupted. Use Retry workflow to safely finish saving it.",
+                trusted_backend=True,
+                structured_data={"workflow_error": "persistence", "retry_available": True},
+            )
+
+    async def _invoke_graph(
+        self, decision_id: UUID, payload: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        config = {"configurable": {"thread_id": f"{self.user.id}:{decision_id}"}}
+        if not self.settings.database_url:
+            if payload is None:
+                raise HTTPException(status_code=503, detail="Durable workflow checkpoints are not configured")
+            return await build_decision_graph(self.settings).ainvoke(payload)
+        connection_string = self.settings.database_url.get_secret_value()
+        async with AsyncPostgresSaver.from_conn_string(connection_string) as checkpointer:
+            await checkpointer.setup()
+            for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes", "checkpoint_migrations"):
+                await checkpointer.conn.execute(
+                    f"alter table public.{table} enable row level security"
+                )
+                await checkpointer.conn.execute(
+                    f"revoke all on table public.{table} from anon, authenticated"
+                )
+            graph = build_decision_graph(self.settings, checkpointer=checkpointer)
+            return await graph.ainvoke(payload, config=config)
+
+    async def retry_workflow(self, decision_id: UUID) -> DecisionMessage:
+        decision = await self.get(decision_id)
+        if decision.status == "completed":
+            raise HTTPException(status_code=409, detail="This decision is already completed")
+        try:
+            result = await self._invoke_graph(decision_id, None)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail="The saved workflow could not be resumed") from exc
+        message_id = result.get("message_id")
+        user_message = next(
+            (message for message in decision.messages if str(message.id) == message_id), None
+        )
+        if not user_message:
+            raise HTTPException(status_code=409, detail="The checkpoint does not reference a valid user message")
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            profile = await self._load_policy_profile(client)
+            return await self._persist_graph_result(
+                client,
+                decision_id,
+                user_message,
+                [option.model_dump(mode="json") for option in decision.options],
+                profile,
+                result,
+            )
+
+    async def _persist_graph_result(
+        self,
+        client: httpx.AsyncClient,
+        decision_id: UUID,
+        user_message: DecisionMessage,
+        options: list[dict[str, Any]],
+        profile: ClarificationProfile,
+        result: dict[str, Any],
+    ) -> DecisionMessage:
+
+        if result.get("direction_changed"):
+            await self._request(
+                client,
+                "PATCH",
+                "decision_options",
+                params={"decision_id": f"eq.{decision_id}", "status": "neq.rejected"},
+                json={"status": "rejected"},
+                trusted_backend=True,
+            )
+        persisted_option_ids = [] if result.get("direction_changed") else [
+            str(option["id"]) for option in options if option.get("status") != "rejected"
+        ]
+        for position, option in enumerate(result.get("new_options", []), start=len(options)):
+            rows = await self._request(
+                client,
+                "POST",
+                "decision_options",
+                params={"on_conflict": "decision_id,title"},
+                json={
+                    "decision_id": str(decision_id),
+                    "title": option["title"],
+                    "description": option.get("description"),
+                    "position": position,
+                    "source": option.get("source", "ai_extracted"),
+                    "metadata": {"evidence_message_id": str(user_message.id)},
+                },
+                prefer_representation=True,
+                trusted_backend=True,
+                prefer="resolution=merge-duplicates",
+            )
+            persisted_option_ids.append(str(rows[0]["id"]))
+
+        updated_brief = result["brief"]
+        updated_brief["option_ids"] = persisted_option_ids
+        recommendation = result.get("recommendation")
+        phase_status = {
+            "clarifying": "exploring",
+            "evaluating": "evaluating",
+            "completed": "completed",
+        }.get(updated_brief["phase"], "exploring")
+        await self._record_state_event(
+            client,
+            decision_id,
+            "direction_changed" if result.get("direction_changed") else "conversation_turn",
+            updated_brief["revision"],
+            {
+                "message_id": str(user_message.id),
+                "patch": result.get("patch", {}),
+                "duplicate_options": result.get("duplicate_options", []),
+            },
+        )
+
+        if recommendation:
+            severities = [risk.get("severity", "moderate") for risk in recommendation.get("key_risks", [])]
+            risk_level = "high" if any(level in ("high", "critical") for level in severities) else "moderate" if severities else "unknown"
+            existing_evaluations = await self._request(
+                client, "GET", "evaluations",
+                params={"decision_id": f"eq.{decision_id}", "select": "id", "limit": "1"},
+                trusted_backend=True,
+            )
+            if not existing_evaluations:
+                await self._request(
+                    client,
+                    "POST",
+                    "evaluations",
+                    json={
+                        "decision_id": str(decision_id),
+                        "summary": recommendation["summary"],
+                        "confidence": None,
+                        "risk_level": risk_level,
+                        "reasoning": recommendation["rationale"],
+                        "checks": {
+                            "robustness": recommendation["robustness"],
+                            "sensitivity_analysis": recommendation["sensitivity_analysis"],
+                            "assumptions": recommendation["assumptions"],
+                            "unresolved_uncertainties": recommendation["unresolved_uncertainties"],
+                            "key_risks": recommendation.get("key_risks", []),
+                            "checks_before_acting": recommendation.get("checks_before_acting", []),
+                            "alternate_recommendation": recommendation.get("alternate_recommendation"),
+                        },
+                    },
+                    trusted_backend=True,
+                )
+
+        selected = result["selected_action"]
+        if selected["action"] == "ask_clarification":
+            stats = profile.action_stats.setdefault(selected["category"], PolicyActionStats())
+            stats.asked += 1
+            await self._request(
+                client,
+                "POST",
+                "clarification_events",
+                params={"on_conflict": "user_id,message_id,action_category"},
+                json={
+                    "user_id": str(self.user.id),
+                    "decision_id": str(decision_id),
+                    "message_id": str(user_message.id),
+                    "action_category": selected["category"],
+                    "selected_question": selected.get("question"),
+                    "context": {"utility": selected["utility"], "state_revision": updated_brief["revision"]},
+                },
+                trusted_backend=True,
+                prefer="resolution=ignore-duplicates",
+            )
+        await self._request(
+            client,
+            "PATCH",
+            "decisions",
+            params={"id": f"eq.{decision_id}", "user_id": f"eq.{self.user.id}"},
+            json={
+                "decision_brief": updated_brief,
+                "status": phase_status,
+                **({"recommendation": recommendation} if recommendation else {}),
+            },
+            trusted_backend=True,
+        )
+        return await self._insert_message(
+            client,
+            decision_id,
+            "assistant",
+            result["assistant_reply"],
+            trusted_backend=True,
+            structured_data={
+                "action": selected,
+                "duplicate_options": result.get("duplicate_options", []),
+                "state_revision": updated_brief["revision"],
+                "workflow_error": result.get("recommendation_error"),
+            },
+        )
+
+    async def _record_state_event(
+        self,
+        client: httpx.AsyncClient,
+        decision_id: UUID,
+        event_type: str,
+        revision: int,
+        payload: dict[str, Any],
+    ) -> None:
+        await self._request(
+            client,
+            "POST",
+            "decision_state_events",
+            json={
+                "decision_id": str(decision_id),
+                "user_id": str(self.user.id),
+                "revision": revision,
+                "event_type": event_type,
+                "payload": payload,
+            },
+            trusted_backend=True,
+        )
+
+    async def create_option(
+        self, decision_id: UUID, values: DecisionOptionCreate
+    ) -> DecisionOption:
+        decision = await self.get(decision_id)
+        if decision.status == "completed":
+            raise HTTPException(status_code=409, detail="Completed decisions cannot be changed")
+        if any(_same_option(values.title, item.title) for item in decision.options):
+            raise HTTPException(status_code=409, detail="A similar option already exists")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            rows = await self._request(
+                client, "POST", "decision_options",
+                json={"decision_id": str(decision_id), "title": values.title, "description": values.description, "position": len(decision.options), "source": "user_provided", "status": "confirmed"},
+                prefer_representation=True,
+            )
+        return DecisionOption.model_validate(rows[0])
+
+    async def update_option(
+        self, decision_id: UUID, option_id: UUID, values: DecisionOptionUpdate
+    ) -> DecisionOption:
+        decision = await self.get(decision_id)
+        if decision.status == "completed":
+            raise HTTPException(status_code=409, detail="Completed decisions cannot be changed")
+        if any(item.id != option_id and _same_option(values.title, item.title) for item in decision.options):
+            raise HTTPException(status_code=409, detail="A similar option already exists")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            rows = await self._request(client, "PATCH", "decision_options", params={"id": f"eq.{option_id}", "decision_id": f"eq.{decision_id}"}, json={"title": values.title, "description": values.description}, prefer_representation=True)
+        if not rows:
+            raise HTTPException(status_code=404, detail="Option not found")
+        return DecisionOption.model_validate(rows[0])
+
+    async def delete_option(self, decision_id: UUID, option_id: UUID) -> None:
+        decision = await self.get(decision_id)
+        if decision.status == "completed":
+            raise HTTPException(status_code=409, detail="Completed decisions cannot be changed")
+        if not any(item.id == option_id for item in decision.options):
+            raise HTTPException(status_code=404, detail="Option not found")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await self._request(client, "DELETE", "decision_options", params={"id": f"eq.{option_id}", "decision_id": f"eq.{decision_id}"})
+
+    async def review_option(
+        self, decision_id: UUID, option_id: UUID, values: DecisionOptionStatusUpdate
+    ) -> DecisionOption:
+        decision = await self.get(decision_id)
+        if decision.status == "completed":
+            raise HTTPException(status_code=409, detail="Completed decisions cannot be changed")
+        if not any(item.id == option_id for item in decision.options):
+            raise HTTPException(status_code=404, detail="Option not found")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            rows = await self._request(
+                client, "PATCH", "decision_options",
+                params={"id": f"eq.{option_id}", "decision_id": f"eq.{decision_id}"},
+                json={"status": values.status}, prefer_representation=True,
+            )
+        return DecisionOption.model_validate(rows[0])
+
+    async def review_state_item(
+        self, decision_id: UUID, values: DecisionStateItemReview
+    ) -> DecisionDetail:
+        decision = await self.get(decision_id)
+        if decision.status == "completed":
+            raise HTTPException(status_code=409, detail="Completed decisions cannot be changed")
+        brief = dict(decision.decision_brief)
+        items = list(brief.get(values.collection, []))
+        item = next((candidate for candidate in items if candidate.get("id") == values.item_id), None)
+        if not item:
+            raise HTTPException(status_code=404, detail="Decision Brief item not found")
+        item["status"] = values.status
+        if values.replacement:
+            field = {
+                "criteria": "name", "assumptions": "statement", "risks": "title",
+            }.get(values.collection, "value")
+            item[field] = values.replacement
+            item["source"] = "confirmed"
+            item["confidence"] = "high"
+        brief[values.collection] = items
+        brief["revision"] = int(brief.get("revision", 0)) + 1
+        brief["phase"] = "clarifying"
+        brief["readiness"] = {"score": 0, "enough_to_recommend": False, "blockers": ["Decision Brief changed; reassessment required."]}
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await self._request(
+                client, "PATCH", "decisions",
+                params={"id": f"eq.{decision_id}", "user_id": f"eq.{self.user.id}"},
+                json={"decision_brief": brief, "status": "exploring"}, trusted_backend=True,
+            )
+            await self._record_state_event(client, decision_id, "item_reviewed", brief["revision"], values.model_dump(mode="json"))
+        return await self.get(decision_id)
+
+    async def resolve_contradiction(
+        self, decision_id: UUID, values: ContradictionResolution
+    ) -> DecisionDetail:
+        decision = await self.get(decision_id)
+        if decision.status == "completed":
+            raise HTTPException(status_code=409, detail="Completed decisions cannot be changed")
+        brief = dict(decision.decision_brief)
+        contradictions = list(brief.get("contradictions", []))
+        contradiction = next((item for item in contradictions if item.get("id") == values.contradiction_id), None)
+        if not contradiction:
+            raise HTTPException(status_code=404, detail="Contradiction not found")
+        if values.resolution == "custom" and not values.custom_value:
+            raise HTTPException(status_code=422, detail="A custom resolution value is required")
+        chosen = {
+            "previous": contradiction["previous_value"],
+            "new": contradiction["new_value"],
+            "custom": values.custom_value,
+        }[values.resolution]
+        topic = contradiction["topic"]
+        current = dict(brief.get(topic) or {})
+        current.update({"value": chosen, "source": "confirmed", "confidence": "high", "status": "confirmed"})
+        brief[topic] = current
+        contradiction["status"] = "resolved"
+        contradiction["resolution"] = str(chosen)
+        brief["contradictions"] = contradictions
+        brief["revision"] = int(brief.get("revision", 0)) + 1
+        brief["phase"] = "clarifying"
+        brief["readiness"] = {"score": 0, "enough_to_recommend": False, "blockers": ["Contradiction resolved; reassessment required."]}
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await self._request(
+                client, "PATCH", "decisions",
+                params={"id": f"eq.{decision_id}", "user_id": f"eq.{self.user.id}"},
+                json={"decision_brief": brief, "status": "exploring"}, trusted_backend=True,
+            )
+            await self._record_state_event(client, decision_id, "contradiction_resolved", brief["revision"], values.model_dump(mode="json"))
+        return await self.get(decision_id)
+
 
     @staticmethod
     def _encode_cursor(updated_at: datetime, decision_id: UUID) -> str:

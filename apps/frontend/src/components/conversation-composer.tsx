@@ -24,9 +24,13 @@ function SendButton({ pending }: { pending: boolean }) {
 export function ConversationComposer({
   action,
   messages,
+  readOnly = false,
+  readOnlyMessage = "This decision is complete. You can still rename it, but its conversation and options are read-only.",
 }: {
   action: (formData: FormData) => void | Promise<void>;
   messages?: ConversationMessage[];
+  readOnly?: boolean;
+  readOnlyMessage?: string;
 }) {
   const formRef = useRef<HTMLFormElement>(null);
   const conversationRef = useRef<HTMLDivElement | null>(null);
@@ -135,7 +139,7 @@ export function ConversationComposer({
           </div>
         </div>
       )}
-      <form ref={formRef} onSubmit={handleSubmit} className="flex items-end gap-2">
+      {!readOnly ? <form ref={formRef} onSubmit={handleSubmit} className="flex items-end gap-2">
         <textarea
           name="message"
           className="field min-h-12 min-w-0 flex-1 resize-none p-3 text-sm"
@@ -147,7 +151,11 @@ export function ConversationComposer({
           onKeyDown={handleKeyDown}
         />
         <SendButton pending={pending} />
-      </form>
+      </form> : (
+        <p className="rounded-lg bg-brand-soft px-3 py-2 text-xs text-brand-muted">
+          {readOnlyMessage}
+        </p>
+      )}
     </div>
   );
 }

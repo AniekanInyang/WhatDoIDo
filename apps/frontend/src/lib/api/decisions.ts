@@ -29,6 +29,9 @@ export type DecisionOption = {
   description: string | null;
   position: number;
   evaluation: Record<string, unknown>;
+  source: "user_provided" | "ai_extracted" | "ai_generated";
+  status: "candidate" | "confirmed" | "rejected";
+  metadata: Record<string, unknown>;
 };
 
 export type DecisionMessage = {
@@ -36,6 +39,7 @@ export type DecisionMessage = {
   role: "user" | "assistant" | "system";
   content: string;
   created_at: string;
+  structured_data: Record<string, unknown>;
 };
 
 export type Evaluation = {
@@ -124,6 +128,64 @@ export function renameDecision(id: string, title: string) {
   return authenticatedFetch<DecisionSummary>(`/decisions/${encodeURIComponent(id)}/title`, {
     method: "PATCH",
     body: JSON.stringify({ title }),
+  });
+}
+
+export function createDecisionOption(id: string, values: { title: string; description?: string }) {
+  return authenticatedFetch<DecisionOption>(`/decisions/${encodeURIComponent(id)}/options`, {
+    method: "POST",
+    body: JSON.stringify(values),
+  });
+}
+
+export function updateDecisionOption(
+  decisionId: string,
+  optionId: string,
+  values: { title: string; description?: string },
+) {
+  return authenticatedFetch<DecisionOption>(
+    `/decisions/${encodeURIComponent(decisionId)}/options/${encodeURIComponent(optionId)}`,
+    { method: "PATCH", body: JSON.stringify(values) },
+  );
+}
+
+export function deleteDecisionOption(decisionId: string, optionId: string) {
+  return authenticatedFetch<void>(
+    `/decisions/${encodeURIComponent(decisionId)}/options/${encodeURIComponent(optionId)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function reviewDecisionOption(decisionId: string, optionId: string, status: "confirmed" | "rejected") {
+  return authenticatedFetch<DecisionOption>(
+    `/decisions/${encodeURIComponent(decisionId)}/options/${encodeURIComponent(optionId)}/status`,
+    { method: "PATCH", body: JSON.stringify({ status }) },
+  );
+}
+
+export function reviewDecisionBriefItem(
+  decisionId: string,
+  values: { collection: string; item_id: string; status: "confirmed" | "rejected"; replacement?: string },
+) {
+  return authenticatedFetch<DecisionDetail>(`/decisions/${encodeURIComponent(decisionId)}/brief/items`, {
+    method: "PATCH",
+    body: JSON.stringify(values),
+  });
+}
+
+export function resolveDecisionContradiction(
+  decisionId: string,
+  values: { contradiction_id: string; resolution: "previous" | "new" | "custom"; custom_value?: string },
+) {
+  return authenticatedFetch<DecisionDetail>(`/decisions/${encodeURIComponent(decisionId)}/brief/contradictions`, {
+    method: "PATCH",
+    body: JSON.stringify(values),
+  });
+}
+
+export function retryDecisionWorkflow(decisionId: string) {
+  return authenticatedFetch<DecisionMessage>(`/decisions/${encodeURIComponent(decisionId)}/workflow/retry`, {
+    method: "POST",
   });
 }
 

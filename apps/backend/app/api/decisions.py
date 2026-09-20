@@ -12,6 +12,13 @@ from app.models.decision import (
     DecisionDetail,
     DecisionPage,
     DecisionMessageCreate,
+    DecisionMessage,
+    DecisionOption,
+    DecisionOptionCreate,
+    DecisionOptionUpdate,
+    DecisionOptionStatusUpdate,
+    DecisionStateItemReview,
+    ContradictionResolution,
     DecisionSummary,
     DecisionTitleUpdate,
 )
@@ -78,6 +85,78 @@ async def add_decision_message(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> ConversationTurn:
     return await DecisionStore(settings, user).add_message(decision_id, values)
+
+
+@router.post("/{decision_id}/options", response_model=DecisionOption, status_code=status.HTTP_201_CREATED)
+async def create_decision_option(
+    decision_id: UUID,
+    values: DecisionOptionCreate,
+    user: CurrentUser,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> DecisionOption:
+    return await DecisionStore(settings, user).create_option(decision_id, values)
+
+
+@router.patch("/{decision_id}/options/{option_id}", response_model=DecisionOption)
+async def update_decision_option(
+    decision_id: UUID,
+    option_id: UUID,
+    values: DecisionOptionUpdate,
+    user: CurrentUser,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> DecisionOption:
+    return await DecisionStore(settings, user).update_option(decision_id, option_id, values)
+
+
+@router.delete("/{decision_id}/options/{option_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_decision_option(
+    decision_id: UUID,
+    option_id: UUID,
+    user: CurrentUser,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> Response:
+    await DecisionStore(settings, user).delete_option(decision_id, option_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.patch("/{decision_id}/options/{option_id}/status", response_model=DecisionOption)
+async def review_decision_option(
+    decision_id: UUID,
+    option_id: UUID,
+    values: DecisionOptionStatusUpdate,
+    user: CurrentUser,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> DecisionOption:
+    return await DecisionStore(settings, user).review_option(decision_id, option_id, values)
+
+
+@router.patch("/{decision_id}/brief/items", response_model=DecisionDetail)
+async def review_decision_state_item(
+    decision_id: UUID,
+    values: DecisionStateItemReview,
+    user: CurrentUser,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> DecisionDetail:
+    return await DecisionStore(settings, user).review_state_item(decision_id, values)
+
+
+@router.patch("/{decision_id}/brief/contradictions", response_model=DecisionDetail)
+async def resolve_decision_contradiction(
+    decision_id: UUID,
+    values: ContradictionResolution,
+    user: CurrentUser,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> DecisionDetail:
+    return await DecisionStore(settings, user).resolve_contradiction(decision_id, values)
+
+
+@router.post("/{decision_id}/workflow/retry", response_model=DecisionMessage)
+async def retry_decision_workflow(
+    decision_id: UUID,
+    user: CurrentUser,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> DecisionMessage:
+    return await DecisionStore(settings, user).retry_workflow(decision_id)
 
 
 @router.put("/{decision_id}/collection", status_code=status.HTTP_204_NO_CONTENT)

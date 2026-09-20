@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -41,6 +41,9 @@ class DecisionOption(BaseModel):
     description: str | None = None
     position: int
     evaluation: dict[str, Any]
+    source: str = "user_provided"
+    status: str = "candidate"
+    metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
 
@@ -56,6 +59,36 @@ class DecisionMessage(BaseModel):
 
 class DecisionMessageCreate(BaseModel):
     content: str = Field(min_length=1, max_length=50_000)
+
+
+class DecisionOptionCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2_000)
+
+
+class DecisionOptionUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=2_000)
+
+
+class DecisionOptionStatusUpdate(BaseModel):
+    status: Literal["confirmed", "rejected"]
+
+
+class DecisionStateItemReview(BaseModel):
+    collection: Literal[
+        "values", "constraints", "uncertainties", "preference_signals",
+        "criteria", "assumptions", "risks",
+    ]
+    item_id: str
+    status: Literal["confirmed", "rejected"]
+    replacement: str | None = Field(default=None, max_length=2_000)
+
+
+class ContradictionResolution(BaseModel):
+    contradiction_id: str
+    resolution: Literal["previous", "new", "custom"]
+    custom_value: str | None = Field(default=None, max_length=2_000)
 
 
 class ConversationTurn(BaseModel):
