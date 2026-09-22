@@ -66,7 +66,10 @@ function ReviewableItems({ decisionId, collection, title, items, readOnly }: {
 }
 
 
-export default async function SavedDecisionPage({ params }: { params: { id: string } }) {
+export default async function SavedDecisionPage({ params, searchParams }: {
+  params: { id: string };
+  searchParams?: { retry_error?: string };
+}) {
   const decision = await getDecision(params.id);
   const renameAction = renameDecision.bind(null, decision.id);
   const sendAction = sendMessage.bind(null, decision.id);
@@ -110,6 +113,9 @@ export default async function SavedDecisionPage({ params }: { params: { id: stri
     }>;
   };
   const latestAssistant = [...decision.messages].reverse().find((message) => message.role === "assistant");
+  const awaitingReply = decision.status !== "completed"
+    && decision.messages.length > 0
+    && decision.messages[decision.messages.length - 1]?.role === "user";
   const retryAvailable = latestAssistant?.structured_data?.retry_available === true && decision.status !== "completed";
   const visibleOptions = decision.options.filter((option) => option.status !== "rejected");
 
@@ -117,11 +123,18 @@ export default async function SavedDecisionPage({ params }: { params: { id: stri
     <section className="mx-auto max-w-5xl">
       <PageHeader eyebrow="Conversation" title={decision.title} subtitle={`Status: ${decision.status}`} />
 
+      {searchParams?.retry_error && (
+        <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+          {searchParams.retry_error}
+        </div>
+      )}
+
       <div className="grid gap-4 lg:grid-cols-[1.45fr_0.75fr]">
         <article className="surface-card p-5">
           <ConversationComposer
             action={sendAction}
             messages={decision.messages}
+            awaitingReply={awaitingReply}
             readOnly={decision.status === "completed" || retryAvailable}
             readOnlyMessage={retryAvailable ? "The workflow is paused at a failed stage. Retry it before sending another message." : undefined}
           />

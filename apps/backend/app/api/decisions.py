@@ -1,7 +1,7 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, Response, status
 
 from app.core.auth import CurrentUser
 from app.core.config import Settings, get_settings
@@ -31,10 +31,14 @@ router = APIRouter(prefix="/decisions", tags=["decisions"])
 @router.post("", response_model=DecisionSummary, status_code=status.HTTP_201_CREATED)
 async def create_decision(
     values: DecisionCreate,
+    background_tasks: BackgroundTasks,
     user: CurrentUser,
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> DecisionSummary:
-    return await DecisionStore(settings, user).create(values)
+    store = DecisionStore(settings, user)
+    decision, user_message = await store.create_pending(values)
+    background_tasks.add_task(store.process_initial_turn, decision.id, user_message)
+    return decision
 
 
 @router.get("", response_model=DecisionPage)

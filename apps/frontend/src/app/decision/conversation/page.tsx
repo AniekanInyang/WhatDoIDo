@@ -19,15 +19,7 @@ export default function DecisionConversationPage() {
             </span>
           </div>
 
-          <div className="flex min-h-[44vh] items-center justify-center rounded-lg border border-dashed border-brand-border bg-brand-soft/50 p-6 text-center">
-            <div className="max-w-md">
-              <p className="text-base font-semibold text-brand-text">What decision do you need help with?</p>
-              <p className="mt-2 text-sm leading-6 text-brand-muted">
-                Describe the choice in plain language. Once you send the first message, this space becomes the working conversation.
-              </p>
-            </div>
-          </div>
-          <ConversationComposer action={startDecision} />
+          <ConversationComposer action={startDecision} showEmptyState />
         </article>
 
         <aside className="surface-card p-5">

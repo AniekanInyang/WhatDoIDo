@@ -1,5 +1,7 @@
 import base64
 import json
+import logging
+import re
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -7,6 +9,7 @@ from uuid import UUID
 import httpx
 from fastapi import HTTPException, status
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg import Error as PsycopgError
 
 from app.core.auth import AuthenticatedUser
 from app.core.config import Settings
@@ -29,6 +32,14 @@ from app.models.decision import (
 )
 from app.graph.state import ClarificationProfile, PolicyActionStats
 from app.graph.workflow import _same_option, build_decision_graph
+from app.llm.decision_assistant import (
+    DecisionLLMBudgetError,
+    DecisionLLMGenerationError,
+    DecisionLLMRateLimitError,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 class DecisionStore:
@@ -106,6 +117,14 @@ class DecisionStore:
         return payload if isinstance(payload, list) else [payload]
 
     async def create(self, values: DecisionCreate) -> DecisionSummary:
+        decision, user_message = await self.create_pending(values)
+        await self.process_initial_turn(decision.id, user_message)
+        return decision
+
+    async def create_pending(
+        self, values: DecisionCreate
+    ) -> tuple[DecisionSummary, DecisionMessage]:
+        """Persist the decision and first message without waiting for the AI workflow."""
         title = self._title_from_prompt(values.prompt)
         async with httpx.AsyncClient(timeout=10.0) as client:
             rows = await self._request(
@@ -123,17 +142,27 @@ class DecisionStore:
             user_message = await self._insert_message(
                 client, decision.id, "user", values.prompt, trusted_backend=False
             )
-            await self._run_conversation_turn(client, decision.id, user_message, {}, [])
-        return decision
+        return decision, user_message
+
+    async def process_initial_turn(
+        self, decision_id: UUID, user_message: DecisionMessage
+    ) -> None:
+        """Run the first AI turn after the create response has been sent."""
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await self._run_conversation_turn(client, decision_id, user_message, {}, [])
 
     @staticmethod
     def _title_from_prompt(prompt: str) -> str:
         normalized = " ".join(prompt.strip().split())
+        if any(char.isalpha() for char in normalized) and normalized == normalized.upper():
+            normalized = normalized.lower()
+        normalized = normalized[:1].upper() + normalized[1:]
+        normalized = re.sub(r"\bi\b", "I", normalized)
         words = normalized.rstrip("?.!").split()
         title = " ".join(words[:8])
         if len(words) > 8:
             title += "…"
-        return title[:1].upper() + title[1:]
+        return title
 
     async def _insert_message(
         self,
@@ -201,6 +230,8 @@ class DecisionStore:
         decision_id: UUID,
         response: str,
         profile: ClarificationProfile,
+        *,
+        resolved: bool,
     ) -> ClarificationProfile:
         rows = await self._request(
             client,
@@ -222,11 +253,11 @@ class DecisionStore:
         skipped_words = {"skip", "pass", "not sure", "i don't know", "idk"}
         normalized = " ".join(response.lower().strip().split())
         skipped = normalized in skipped_words
-        reward = -0.5 if skipped else 1.0
+        reward = -0.5 if skipped else (1.0 if resolved else -0.15)
         category = rows[0]["action_category"]
         stats = profile.action_stats.setdefault(category, PolicyActionStats())
         stats.skipped += int(skipped)
-        stats.answered += int(not skipped)
+        stats.answered += int(not skipped and resolved)
         stats.reward_sum += reward
         profile.total_interactions += 1
         await self._request(
@@ -234,7 +265,7 @@ class DecisionStore:
             "PATCH",
             "clarification_events",
             params={"id": f"eq.{rows[0]['id']}", "user_id": f"eq.{self.user.id}"},
-            json={"outcome": "skipped" if skipped else "answered", "reward": reward},
+            json={"outcome": "skipped" if skipped else ("answered" if resolved else "unresolved"), "reward": reward},
             trusted_backend=True,
         )
         return profile
@@ -242,21 +273,6 @@ class DecisionStore:
     async def _save_policy_profile(
         self, client: httpx.AsyncClient, profile: ClarificationProfile
     ) -> None:
-        existing = await self._request(
-            client,
-            "GET",
-            "decision_state_events",
-            params={
-                "decision_id": f"eq.{decision_id}",
-                "revision": f"eq.{revision}",
-                "event_type": f"eq.{event_type}",
-                "select": "id",
-                "limit": "1",
-            },
-            trusted_backend=True,
-        )
-        if existing:
-            return
         await self._request(
             client,
             "POST",
@@ -276,10 +292,6 @@ class DecisionStore:
         options: list[dict[str, Any]],
     ) -> DecisionMessage:
         profile = await self._load_policy_profile(client)
-        profile = await self._learn_from_previous_question(
-            client, decision_id, user_message.content, profile
-        )
-        await self._save_policy_profile(client, profile)
         payload = {
                 "decision_id": str(decision_id),
                 "user_id": str(self.user.id),
@@ -293,7 +305,44 @@ class DecisionStore:
             }
         try:
             result = await self._invoke_graph(decision_id, payload)
+        except DecisionLLMRateLimitError:
+            await self._record_state_event(
+                client, decision_id, "workflow_rate_limited", int(brief.get("revision", 0)),
+                {"message_id": str(user_message.id), "retryable": True},
+            )
+            return await self._insert_message(
+                client, decision_id, "assistant",
+                "The AI service has reached its usage limit. Your progress is saved; please try Retry workflow later.",
+                trusted_backend=True,
+                structured_data={"workflow_error": "rate_limited", "retry_available": True},
+            )
+        except DecisionLLMBudgetError:
+            await self._record_state_event(
+                client, decision_id, "workflow_budget_exhausted", int(brief.get("revision", 0)),
+                {"message_id": str(user_message.id), "retryable": False},
+            )
+            return await self._insert_message(
+                client, decision_id, "assistant",
+                "This decision has reached its AI usage budget. Your progress is saved, but no additional model calls will be made.",
+                trusted_backend=True,
+                structured_data={"workflow_error": "budget_exhausted", "retry_available": False},
+            )
+        except DecisionLLMGenerationError:
+            await self._record_state_event(
+                client, decision_id, "question_generation_unavailable", int(brief.get("revision", 0)),
+                {"message_id": str(user_message.id), "retryable": True},
+            )
+            return await self._insert_message(
+                client, decision_id, "assistant",
+                "I couldn’t generate the next question right now. Your progress is saved; please try Retry workflow later.",
+                trusted_backend=True,
+                structured_data={"workflow_error": "question_unavailable", "retry_available": True},
+            )
         except Exception:
+            logger.exception(
+                "Decision workflow failed for decision %s at the initial conversation turn",
+                decision_id,
+            )
             await self._record_state_event(
                 client, decision_id, "workflow_failed", int(brief.get("revision", 0)),
                 {"message_id": str(user_message.id), "retryable": True},
@@ -304,6 +353,12 @@ class DecisionStore:
                 trusted_backend=True,
                 structured_data={"workflow_error": "retryable", "retry_available": True},
             )
+        previous_action = brief.get("next_action") or {}
+        resolved = self._target_was_resolved(previous_action, brief, result, options)
+        profile = await self._learn_from_previous_question(
+            client, decision_id, user_message.content, profile, resolved=resolved
+        )
+        await self._save_policy_profile(client, profile)
         try:
             return await self._persist_graph_result(
                 client, decision_id, user_message, options, profile, result
@@ -316,43 +371,116 @@ class DecisionStore:
                 structured_data={"workflow_error": "persistence", "retry_available": True},
             )
 
+    @staticmethod
+    def _target_was_resolved(
+        action: dict[str, Any],
+        before: dict[str, Any],
+        result: dict[str, Any],
+        previous_options: list[dict[str, Any]],
+    ) -> bool:
+        """Reward the policy only when its requested state target changed."""
+        target = action.get("target_field") or action.get("category")
+        if target == "criterion_importance":
+            target = "criteria"
+        after = result.get("brief") or {}
+        list_fields = {"values", "criteria", "constraints", "uncertainties"}
+        if target == "options":
+            old_count = len([item for item in previous_options if item.get("status") != "rejected"])
+            return old_count + len(result.get("new_options", [])) > old_count
+        if target in list_fields:
+            return (
+                len(after.get(target, [])) > len(before.get(target, []))
+                or target in after.get("resolved_absences", [])
+            )
+        if target == "risk":
+            target = "risk_tolerance"
+        if target == "risk_tolerance" and target in after.get("resolved_absences", []):
+            return True
+        if target in {"goal", "domain", "deadline", "risk_tolerance"}:
+            return after.get(target) != before.get(target) and after.get(target) is not None
+        if action.get("action") == "confirm_inference":
+            return any(item.get("status") != "candidate" for item in after.get("assumptions", []))
+        if action.get("action") == "resolve_contradiction":
+            return any(item.get("status") == "resolved" for item in after.get("contradictions", []))
+        return False
+
     async def _invoke_graph(
-        self, decision_id: UUID, payload: dict[str, Any] | None
+        self, decision_id: UUID, payload: dict[str, Any] | None, *, fresh: bool = False
     ) -> dict[str, Any]:
-        config = {"configurable": {"thread_id": f"{self.user.id}:{decision_id}"}}
+        thread_id = f"{self.user.id}:{decision_id}"
+        if fresh:
+            thread_id = f"{thread_id}:retry:{datetime.now().timestamp()}"
+        config = {"configurable": {"thread_id": thread_id}}
         if not self.settings.database_url:
             if payload is None:
                 raise HTTPException(status_code=503, detail="Durable workflow checkpoints are not configured")
             return await build_decision_graph(self.settings).ainvoke(payload)
         connection_string = self.settings.database_url.get_secret_value()
-        async with AsyncPostgresSaver.from_conn_string(connection_string) as checkpointer:
-            await checkpointer.setup()
-            for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes", "checkpoint_migrations"):
-                await checkpointer.conn.execute(
-                    f"alter table public.{table} enable row level security"
-                )
-                await checkpointer.conn.execute(
-                    f"revoke all on table public.{table} from anon, authenticated"
-                )
-            graph = build_decision_graph(self.settings, checkpointer=checkpointer)
-            return await graph.ainvoke(payload, config=config)
+        try:
+            async with AsyncPostgresSaver.from_conn_string(connection_string) as checkpointer:
+                await checkpointer.setup()
+                for table in ("checkpoints", "checkpoint_blobs", "checkpoint_writes", "checkpoint_migrations"):
+                    await checkpointer.conn.execute(
+                        f"alter table public.{table} enable row level security"
+                    )
+                    await checkpointer.conn.execute(
+                        f"revoke all on table public.{table} from anon, authenticated"
+                    )
+                graph = build_decision_graph(self.settings, checkpointer=checkpointer)
+                return await graph.ainvoke(payload, config=config)
+        except PsycopgError:
+            logger.exception(
+                "Durable workflow checkpointing failed for decision %s; continuing from application state",
+                decision_id,
+            )
+            if payload is None:
+                raise
+            return await build_decision_graph(self.settings).ainvoke(payload)
 
     async def retry_workflow(self, decision_id: UUID) -> DecisionMessage:
         decision = await self.get(decision_id)
         if decision.status == "completed":
             raise HTTPException(status_code=409, detail="This decision is already completed")
-        try:
-            result = await self._invoke_graph(decision_id, None)
-        except Exception as exc:
-            raise HTTPException(status_code=503, detail="The saved workflow could not be resumed") from exc
-        message_id = result.get("message_id")
         user_message = next(
-            (message for message in decision.messages if str(message.id) == message_id), None
+            (message for message in reversed(decision.messages) if message.role == "user"), None
         )
         if not user_message:
-            raise HTTPException(status_code=409, detail="The checkpoint does not reference a valid user message")
+            raise HTTPException(status_code=409, detail="This decision has no user message to retry")
         async with httpx.AsyncClient(timeout=15.0) as client:
             profile = await self._load_policy_profile(client)
+            payload = {
+                "decision_id": str(decision_id),
+                "user_id": str(self.user.id),
+                "user_message": user_message.content,
+                "message_id": str(user_message.id),
+                "brief": decision.decision_brief,
+                "existing_options": [option.model_dump(mode="json") for option in decision.options],
+                "profile": profile.model_dump(mode="json"),
+                "recommendation": {},
+                "recommendation_error": "",
+            }
+            try:
+                # A retry starts from persisted application state instead of replaying
+                # a stale failed task from a checkpoint created by older code.
+                result = await self._invoke_graph(decision_id, payload, fresh=True)
+            except DecisionLLMRateLimitError as exc:
+                raise HTTPException(
+                    status_code=429,
+                    detail="The AI service usage limit is still active. Please retry later.",
+                ) from exc
+            except DecisionLLMBudgetError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="This decision has reached its AI usage budget.",
+                ) from exc
+            except DecisionLLMGenerationError as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Question generation is temporarily unavailable. Please retry later.",
+                ) from exc
+            except Exception as exc:
+                logger.exception("Fresh workflow retry failed for decision %s", decision_id)
+                raise HTTPException(status_code=503, detail="The workflow could not be retried") from exc
             return await self._persist_graph_result(
                 client,
                 decision_id,
@@ -510,6 +638,21 @@ class DecisionStore:
         revision: int,
         payload: dict[str, Any],
     ) -> None:
+        existing = await self._request(
+            client,
+            "GET",
+            "decision_state_events",
+            params={
+                "decision_id": f"eq.{decision_id}",
+                "revision": f"eq.{revision}",
+                "event_type": f"eq.{event_type}",
+                "select": "id",
+                "limit": "1",
+            },
+            trusted_backend=True,
+        )
+        if existing:
+            return
         await self._request(
             client,
             "POST",

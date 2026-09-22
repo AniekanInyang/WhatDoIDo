@@ -8,11 +8,13 @@ from pydantic import BaseModel, Field
 
 Confidence = Literal["low", "medium", "high"]
 FactSource = Literal["explicit", "inferred", "confirmed", "system_derived"]
+DecisionStakes = Literal["low", "medium", "high"]
+ResolvableField = Literal["constraints", "uncertainties", "risk_tolerance"]
 
 
 class Fact(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
-    value: Any
+    value: str
     source: FactSource = "inferred"
     confidence: Confidence = "medium"
     status: Literal["candidate", "confirmed", "rejected", "superseded"] = "confirmed"
@@ -67,6 +69,7 @@ class OptionObservation(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     description: str | None = Field(default=None, max_length=2_000)
     source: Literal["user_provided", "ai_extracted", "ai_generated"] = "ai_extracted"
+    kind: Literal["alternative", "context"] = "alternative"
 
 
 class DecisionStatePatch(BaseModel):
@@ -74,6 +77,7 @@ class DecisionStatePatch(BaseModel):
     non_decision_reason: str | None = None
     direction_change: bool = False
     direction_change_summary: str | None = None
+    decision_stakes: DecisionStakes | None = None
     goal: Fact | None = None
     domain: Fact | None = None
     deadline: Fact | None = None
@@ -86,6 +90,7 @@ class DecisionStatePatch(BaseModel):
     assumptions: list[Assumption] = Field(default_factory=list)
     risks: list[DecisionRisk] = Field(default_factory=list)
     options: list[OptionObservation] = Field(default_factory=list)
+    resolved_absences: list[ResolvableField] = Field(default_factory=list)
 
 
 class InformationGap(BaseModel):
@@ -93,7 +98,6 @@ class InformationGap(BaseModel):
     question_category: str
     reason: str
     impact: float = Field(ge=0, le=1)
-    base_question: str
 
 
 class Readiness(BaseModel):
@@ -108,6 +112,17 @@ class ActionPlan(BaseModel):
     question: str | None = None
     rationale: str
     utility: float = 0
+    expected_answer_type: str | None = None
+    target_field: str | None = None
+    attempt: int = 1
+
+
+class QuestionDraft(BaseModel):
+    question: str = Field(min_length=3, max_length=500)
+    target_field: str
+    expected_answer_type: str
+    acknowledges_answer: bool = False
+    suggested_options: list[OptionObservation] = Field(default_factory=list)
 
 
 class OptionAssessment(BaseModel):
@@ -143,10 +158,21 @@ class RecommendationResult(BaseModel):
     caveat: str | None = None
 
 
+class LLMUsage(BaseModel):
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    calls: int = 0
+    cache_hits: int = 0
+    budget_tokens: int = 20_000
+    exhausted: bool = False
+
+
 class DecisionBrief(BaseModel):
     schema_version: int = 2
     revision: int = 0
     phase: Literal["intake", "clarifying", "evaluating", "completed"] = "intake"
+    decision_stakes: DecisionStakes | None = None
     goal: Fact | None = None
     domain: Fact | None = None
     deadline: Fact | None = None
@@ -159,11 +185,15 @@ class DecisionBrief(BaseModel):
     assumptions: list[Assumption] = Field(default_factory=list)
     contradictions: list[Contradiction] = Field(default_factory=list)
     risks: list[DecisionRisk] = Field(default_factory=list)
+    resolved_absences: list[ResolvableField] = Field(default_factory=list)
     superseded_states: list[dict[str, Any]] = Field(default_factory=list)
     option_ids: list[str] = Field(default_factory=list)
     missing_information: list[InformationGap] = Field(default_factory=list)
     readiness: Readiness = Field(default_factory=lambda: Readiness(score=0))
     next_action: ActionPlan | None = None
+    question_history: list[dict[str, Any]] = Field(default_factory=list)
+    llm_usage: LLMUsage = Field(default_factory=LLMUsage)
+    llm_cache: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class PolicyActionStats(BaseModel):
@@ -197,6 +227,8 @@ class GraphState(TypedDict, total=False):
     duplicate_options: list[dict[str, str]]
     assistant_reply: str
     selected_action: dict[str, Any]
+    question_request: dict[str, Any]
+    extraction_diagnostic: dict[str, Any]
     recommendation: dict[str, Any]
     recommendation_error: str
     is_decision_input: bool

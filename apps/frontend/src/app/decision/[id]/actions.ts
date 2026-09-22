@@ -12,6 +12,7 @@ import {
   retryDecisionWorkflow,
 } from "@/lib/api/decisions";
 import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
 
 
 export async function renameDecision(id: string, formData: FormData) {
@@ -27,8 +28,9 @@ export async function sendMessage(id: string, formData: FormData) {
   const content = String(formData.get("message") ?? "").trim();
   if (!content) return;
 
-  await addDecisionMessage(id, content);
+  const turn = await addDecisionMessage(id, content);
   revalidatePath(`/decision/${id}`);
+  return turn;
 }
 
 export async function createOption(id: string, formData: FormData) {
@@ -84,6 +86,14 @@ export async function resolveContradiction(
 }
 
 export async function retryWorkflow(id: string) {
-  await retryDecisionWorkflow(id);
+  let retryError: string | null = null;
+  try {
+    await retryDecisionWorkflow(id);
+  } catch (error) {
+    retryError = error instanceof Error ? error.message : "The workflow could not be retried.";
+  }
+  if (retryError) {
+    redirect(`/decision/${id}?retry_error=${encodeURIComponent(retryError)}`);
+  }
   revalidatePath(`/decision/${id}`);
 }
