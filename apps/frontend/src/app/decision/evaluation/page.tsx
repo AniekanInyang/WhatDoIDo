@@ -1,70 +1,42 @@
 import { PageHeader } from "@/components/page-header";
+import { getDecision } from "@/lib/api/decisions";
+import Link from "next/link";
+import { redirect } from "next/navigation";
 
-const options = [
-  { name: "Join startup", upside: "High learning speed", downside: "Income volatility", score: 82, risk: "Moderate" },
-  { name: "Stay current role", upside: "Financial stability", downside: "Slower growth", score: 74, risk: "Low" },
-  { name: "Negotiate hybrid path", upside: "Balanced risk", downside: "Execution complexity", score: 79, risk: "Medium" },
-];
+export default async function EvaluationBoardPage({ searchParams }: { searchParams: { id?: string } }) {
+  if (!searchParams.id) redirect("/history");
+  const decision = await getDecision(searchParams.id);
+  const recommendation = decision.recommendation as null | {
+    option_assessments?: Array<{ option_id: string; option_title: string; fit: string; strengths: string[]; tradeoffs: string[]; constraint_conflicts: string[] }>;
+    key_risks?: Array<{ id?: string; title: string; severity: string; likelihood: string; description: string; mitigation?: string | null }>;
+    robustness?: string;
+  };
+  const assessments = recommendation?.option_assessments ?? [];
 
-export default function EvaluationBoardPage() {
   return (
     <section>
-      <PageHeader eyebrow="Evaluation" title="Option Board" subtitle="Compare options by upside, downside, risk, and score." />
-
-      <div className="grid gap-3 md:hidden">
-        {options.map((option) => (
-          <article key={option.name} className="surface-card p-4">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-[11px] uppercase tracking-[0.15em] text-brand-muted">Option</p>
-                <h3 className="mt-1 text-lg font-semibold text-brand-text">{option.name}</h3>
+      <PageHeader eyebrow="Evaluation" title={decision.title} subtitle="A grounded comparison of every option against the confirmed Decision Brief." />
+      {!assessments.length ? (
+        <article className="surface-card p-5 text-brand-muted">No completed evaluation is available yet.</article>
+      ) : (
+        <div className="grid gap-3 md:grid-cols-2">
+          {assessments.map((option) => (
+            <article key={option.option_id} className="surface-card p-5">
+              <div className="flex justify-between gap-3">
+                <h2 className="text-lg font-semibold text-brand-text">{option.option_title}</h2>
+                <span className="rounded-lg bg-brand-soft px-3 py-1 text-xs font-medium capitalize text-brand-muted">{option.fit} fit</span>
               </div>
-              <span className="rounded-lg bg-brand-primary px-3 py-1.5 text-sm font-semibold text-white">{option.score}</span>
-            </div>
-            <div className="mt-4 grid gap-2">
-              <div className="surface-panel p-3">
-                <p className="text-xs font-medium text-brand-success">Upside</p>
-                <p className="mt-1 text-sm text-brand-text">{option.upside}</p>
+              <div className="mt-4 grid gap-3 text-sm">
+                <div><h3 className="font-medium text-brand-success">Strengths</h3><ul className="mt-1 list-disc pl-5 text-brand-muted">{option.strengths.map((item) => <li key={item}>{item}</li>)}</ul></div>
+                <div><h3 className="font-medium text-brand-warning">Trade-offs</h3><ul className="mt-1 list-disc pl-5 text-brand-muted">{option.tradeoffs.map((item) => <li key={item}>{item}</li>)}</ul></div>
+                {!!option.constraint_conflicts.length && <div><h3 className="font-medium text-red-700">Constraint conflicts</h3><ul className="mt-1 list-disc pl-5 text-red-700">{option.constraint_conflicts.map((item) => <li key={item}>{item}</li>)}</ul></div>}
               </div>
-              <div className="surface-panel p-3">
-                <p className="text-xs font-medium text-brand-warning">Downside</p>
-                <p className="mt-1 text-sm text-brand-text">{option.downside}</p>
-              </div>
-              <div className="surface-panel p-3">
-                <p className="text-xs font-medium text-brand-muted">Risk</p>
-                <p className="mt-1 text-sm text-brand-text">{option.risk}</p>
-              </div>
-            </div>
-          </article>
-        ))}
-      </div>
-
-      <article className="surface-card hidden overflow-hidden md:block">
-        <table className="w-full border-collapse text-sm">
-          <thead className="bg-brand-soft text-left text-brand-muted">
-            <tr>
-              <th className="px-4 py-3 font-medium">Option</th>
-              <th className="px-4 py-3 font-medium">Upside</th>
-              <th className="px-4 py-3 font-medium">Downside</th>
-              <th className="px-4 py-3 font-medium">Risk</th>
-              <th className="px-4 py-3 font-medium">Score</th>
-            </tr>
-          </thead>
-          <tbody>
-            {options.map((option) => (
-              <tr key={option.name} className="border-t border-brand-border">
-                <td className="px-4 py-3 font-semibold text-brand-text">{option.name}</td>
-                <td className="px-4 py-3 text-brand-success">{option.upside}</td>
-                <td className="px-4 py-3 text-brand-warning">{option.downside}</td>
-                <td className="px-4 py-3 text-brand-muted">{option.risk}</td>
-                <td className="px-4 py-3">
-                  <span className="rounded-lg bg-brand-soft px-3 py-1 text-brand-text">{option.score}</span>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </article>
+            </article>
+          ))}
+        </div>
+      )}
+      {!!recommendation?.key_risks?.length && <article className="surface-card mt-4 p-5"><h2 className="font-semibold text-brand-text">Key risks</h2><div className="mt-3 grid gap-2">{recommendation.key_risks.map((risk) => <div key={risk.id ?? risk.title} className="surface-panel p-3 text-sm"><div className="flex justify-between"><p className="font-medium text-brand-text">{risk.title}</p><span className="capitalize text-brand-muted">{risk.severity} · {risk.likelihood}</span></div><p className="mt-1 text-brand-muted">{risk.description}</p>{risk.mitigation && <p className="mt-1 text-brand-muted">Mitigation: {risk.mitigation}</p>}</div>)}</div></article>}
+      <div className="mt-4 flex gap-2"><Link href={`/decision/${decision.id}`} className="rounded-lg border border-brand-border bg-white px-4 py-2 text-sm font-medium">Back to decision</Link>{decision.recommendation && <Link href={`/decision/report?id=${decision.id}`} className="rounded-lg bg-brand-primary px-4 py-2 text-sm font-medium text-white">View report</Link>}</div>
     </section>
   );
 }

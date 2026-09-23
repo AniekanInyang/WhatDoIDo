@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
+from psycopg import AsyncConnection
 from fastapi import HTTPException, status
 
 from app.core.auth import AuthenticatedUser
@@ -85,6 +86,9 @@ class AccountService:
             evaluations = await self._rows(client, "evaluations", params={"select": "*", "order": "created_at.asc"})
             collections = await self._rows(client, "collections", params={"select": "*", "order": "created_at.asc"})
             collection_decisions = await self._rows(client, "collection_decisions", params={"select": "*", "order": "added_at.asc"})
+            clarification_profiles = await self._rows(client, "clarification_profiles", params={"select": "*", "limit": "1"})
+            clarification_events = await self._rows(client, "clarification_events", params={"select": "*", "order": "created_at.asc"})
+            decision_state_events = await self._rows(client, "decision_state_events", params={"select": "*", "order": "created_at.asc"})
         return DataExport(
             exported_at=datetime.now(UTC).isoformat(),
             account={
@@ -100,6 +104,9 @@ class AccountService:
             evaluations=evaluations,
             collections=collections,
             collection_decisions=collection_decisions,
+            clarification_profile=clarification_profiles[0] if clarification_profiles else None,
+            clarification_events=clarification_events,
+            decision_state_events=decision_state_events,
         )
 
     async def delete(self, values: AccountDeletion) -> None:
@@ -120,6 +127,24 @@ class AccountService:
             )
             if verification.status_code != status.HTTP_200_OK:
                 raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+            if self.settings.database_url:
+                async with await AsyncConnection.connect(
+                    self.settings.database_url.get_secret_value()
+                ) as database:
+                    thread_pattern = f"{self.user.id}:%"
+                    await database.execute(
+                        "delete from public.checkpoint_writes where thread_id like %s",
+                        (thread_pattern,),
+                    )
+                    await database.execute(
+                        "delete from public.checkpoint_blobs where thread_id like %s",
+                        (thread_pattern,),
+                    )
+                    await database.execute(
+                        "delete from public.checkpoints where thread_id like %s",
+                        (thread_pattern,),
+                    )
 
             deletion = await client.delete(
                 f"{base_url}/auth/v1/admin/users/{self.user.id}",

@@ -38,3 +38,6 @@ class DataExport(BaseModel):
     evaluations: list[dict[str, Any]]
     collections: list[dict[str, Any]]
     collection_decisions: list[dict[str, Any]]
+    clarification_profile: dict[str, Any] | None = None
+    clarification_events: list[dict[str, Any]] = Field(default_factory=list)
+    decision_state_events: list[dict[str, Any]] = Field(default_factory=list)

@@ -1,7 +1,6 @@
 "use server";
 
 import { createDecision } from "@/lib/api/decisions";
-import { redirect } from "next/navigation";
 
 
 export async function startDecision(formData: FormData) {
@@ -9,5 +8,5 @@ export async function startDecision(formData: FormData) {
   if (!prompt) return;
 
   const decision = await createDecision({ prompt });
-  redirect(`/decision/${decision.id}`);
+  return { redirect_to: `/decision/${decision.id}` };
 }
