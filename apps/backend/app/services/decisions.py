@@ -538,6 +538,7 @@ class DecisionStore:
         phase_status = {
             "clarifying": "exploring",
             "evaluating": "evaluating",
+            "recommended": "evaluating",
             "completed": "completed",
         }.get(updated_brief["phase"], "exploring")
         await self._record_state_event(
@@ -893,6 +894,28 @@ class DecisionStore:
             )
         if not rows:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Decision not found")
+        return DecisionSummary.model_validate(rows[0])
+
+    async def complete(self, decision_id: UUID) -> DecisionSummary:
+        decision = await self.get(decision_id)
+        if decision.status == "completed":
+            return DecisionSummary.model_validate(decision.model_dump())
+        if not decision.recommendation:
+            raise HTTPException(status_code=409, detail="A recommendation is required before completion")
+        brief = dict(decision.decision_brief)
+        brief["phase"] = "completed"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            rows = await self._request(
+                client,
+                "PATCH",
+                "decisions",
+                params={"id": f"eq.{decision_id}", "user_id": f"eq.{self.user.id}"},
+                json={"status": "completed", "decision_brief": brief},
+                prefer_representation=True,
+                trusted_backend=True,
+            )
+        if not rows:
+            raise HTTPException(status_code=404, detail="Decision not found")
         return DecisionSummary.model_validate(rows[0])
 
     async def set_collection(self, decision_id: UUID, values: DecisionCollectionUpdate) -> None:

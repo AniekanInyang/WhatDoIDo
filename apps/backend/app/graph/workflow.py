@@ -4,7 +4,6 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import RetryPolicy
 
 from app.core.config import Settings
 from app.graph.state import (
@@ -22,9 +21,6 @@ from app.graph.state import (
     Readiness,
 )
 from app.llm.decision_assistant import (
-    DecisionLLMBudgetError,
-    DecisionLLMGenerationError,
-    DecisionLLMRateLimitError,
     extract_decision_patch,
     generate_clarification_question,
     generate_grounded_recommendation,
@@ -41,7 +37,17 @@ def _normalized(value: str) -> str:
 
 def _same_option(left: str, right: str) -> bool:
     a, b = _normalized(left), _normalized(right)
-    return bool(a and b) and (a == b or SequenceMatcher(None, a, b).ratio() >= 0.88)
+    if not a or not b:
+        return False
+    if a == b or SequenceMatcher(None, a, b).ratio() >= 0.88:
+        return True
+    a_words, b_words = set(a.split()), set(b.split())
+    shorter = a_words if len(a_words) <= len(b_words) else b_words
+    longer = b_words if shorter is a_words else a_words
+    # Resolve concise selections such as "educational" back to an existing
+    # "Educational tutorial" option, without treating generic short words as
+    # equivalent options.
+    return shorter < longer and shorter.issubset(longer) and all(len(word) >= 5 for word in shorter)
 
 
 def _prepare_fact(fact: Fact) -> Fact:
@@ -138,6 +144,14 @@ def _requests_recommendation(message: str) -> bool:
         "nothing to add", "i am ready", "im ready", "you tell me",
     )
     return any(phrase in normalized for phrase in direct_phrases)
+
+
+def _signals_repeated_question(message: str) -> bool:
+    normalized = _normalized(message)
+    return any(phrase in normalized for phrase in (
+        "i already answered", "already told you", "i just answered",
+        "you asked me that", "same question", "stop repeating",
+    ))
 
 
 def _snapshot_for_supersession(brief: DecisionBrief) -> dict[str, Any]:
@@ -273,6 +287,7 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
         accepted: list[dict[str, Any]] = []
         duplicates: list[dict[str, str]] = []
         all_titles = [str(option["title"]) for option in existing]
+        observed_goal = str((patch.get("goal") or {}).get("value") or "")
         for candidate in patch.get("options", []):
             if candidate.get("kind", "alternative") != "alternative":
                 context_fact = Fact(
@@ -281,9 +296,23 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
                 )
                 brief.preference_signals = _merge_facts(brief.preference_signals, [context_fact])
                 continue
+            if (
+                (brief.goal and _same_option(candidate["title"], str(brief.goal.value)))
+                or (observed_goal and _same_option(candidate["title"], observed_goal))
+            ):
+                # A refined goal is context for the choice, not one of the
+                # mutually selectable alternatives.
+                continue
             duplicate = next((title for title in all_titles if _same_option(candidate["title"], title)), None)
             if duplicate:
                 duplicates.append({"candidate": candidate["title"], "existing": duplicate})
+                if candidate.get("source") == "user_provided":
+                    selection = Fact(
+                        value=f"Selected option: {duplicate}", source="explicit",
+                        confidence="high", status="confirmed",
+                        evidence_message_ids=[state.get("message_id", "")],
+                    )
+                    brief.preference_signals = _merge_facts(brief.preference_signals, [selection])
             else:
                 accepted.append(candidate)
                 all_titles.append(candidate["title"])
@@ -337,7 +366,23 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
         else:
             unresolved = next((item for item in brief.contradictions if item.status == "unresolved"), None)
             assumption = next((item for item in brief.assumptions if item.status == "candidate" and item.importance == "high"), None)
-            if unresolved:
+            active_option_count = len([
+                option for option in state.get("existing_options", [])
+                if option.get("status") != "rejected"
+            ])
+            if _requests_recommendation(state["user_message"]) and active_option_count >= 2:
+                action = ActionPlan(
+                    action="recommend", category="recommendation",
+                    rationale="The user explicitly requested an immediate recommendation; unresolved details must be disclosed as caveats.",
+                    utility=1,
+                )
+            elif _signals_repeated_question(state["user_message"]) and active_option_count >= 2:
+                action = ActionPlan(
+                    action="recommend", category="recommendation",
+                    rationale="The user reported a repeated question; stop interviewing and proceed using the saved information with caveats.",
+                    utility=1,
+                )
+            elif unresolved:
                 action = ActionPlan(
                     action="resolve_contradiction", category="contradiction",
                     target_field=unresolved.topic, expected_answer_type="choose_previous_or_new",
@@ -349,18 +394,17 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
                     target_field="assumptions", expected_answer_type="yes_no_with_correction",
                     rationale=f"Confirm or reject this important assumption: {assumption.statement}", utility=.98,
                 )
-            elif _requests_recommendation(state["user_message"]) and len([
-                option for option in state.get("existing_options", [])
-                if option.get("status") != "rejected"
-            ]) >= 2:
-                action = ActionPlan(action="recommend", category="recommendation", rationale="The user explicitly requested an early recommendation and at least two options are available.", utility=1)
             elif (
-                brief.readiness.enough_to_recommend
-                and brief.next_action is not None
+                brief.next_action is not None
                 and brief.next_action.action == "evaluate"
                 and _normalized(state["user_message"]) in {"yes", "go ahead"}
+                and active_option_count >= 2
             ):
-                action = ActionPlan(action="recommend", category="recommendation", rationale="The user confirmed they want the ready evaluation.", utility=1)
+                action = ActionPlan(
+                    action="recommend", category="recommendation",
+                    rationale="The user confirmed they want the offered evaluation; disclose any missing information as caveats.",
+                    utility=1,
+                )
             elif brief.readiness.enough_to_recommend:
                 action = ActionPlan(
                     action="evaluate", category="evaluation", target_field="recommendation_consent",
@@ -476,6 +520,12 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
     def critique_recommendation(state: GraphState) -> dict[str, Any]:
         """Stress-test grounding before any recommendation reaches the user."""
         result = state.get("recommendation") or {}
+
+        def add_caveat(warning: str) -> None:
+            current = str(result.get("caveat") or "").strip()
+            if warning not in current:
+                result["caveat"] = f"{current} {warning}".strip()
+
         options = {
             str(option["id"]): option for option in state.get("existing_options", [])
             if option.get("status") != "rejected"
@@ -491,9 +541,32 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
         for driver in result.get("sensitivity_analysis", []):
             if driver.get("likely_winner_option_id") not in options:
                 driver["likely_winner_option_id"] = None
+        brief = DecisionBrief.model_validate(state["brief"])
+        active_preferences = [str(item.value) for item in _active(brief.preference_signals)]
+        has_option_specific_evidence = any(
+            any(_normalized(str(option["title"])) in _normalized(preference) for option in options.values())
+            for preference in active_preferences
+        )
+        if not has_option_specific_evidence:
+            evidence_warning = (
+                "The information gathered does not establish that one option will perform better than the others. "
+                "Treat this as a conditional recommendation, not a factual comparison."
+            )
+            add_caveat(evidence_warning)
+            result["robustness"] = "low"
+        if not brief.readiness.enough_to_recommend:
+            unresolved = brief.readiness.blockers or [
+                gap.reason for gap in brief.missing_information
+            ]
+            warning = (
+                "This recommendation was made before every useful detail was resolved. "
+                + ("Remaining uncertainty: " + "; ".join(unresolved[:3]) if unresolved else "Treat it as provisional.")
+            )
+            add_caveat(warning)
+            result["robustness"] = "low"
         if len(result["option_assessments"]) < len(options):
             warning = "Some options lack a complete assessment; review the comparison before acting."
-            result["caveat"] = result.get("caveat") or warning
+            add_caveat(warning)
             result["robustness"] = "low"
         return {"recommendation": result}
 
@@ -501,8 +574,22 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
         """Presentation node: explain the validated result without re-evaluating it."""
         result = RecommendationResult.model_validate(state["recommendation"])
         brief = DecisionBrief.model_validate(state["brief"])
-        brief.phase = "completed"
-        reply = f"My recommendation is {result.selected_option_title}. {result.summary}"
+        brief.phase = "recommended"
+        summary = result.summary.strip()
+        redundant_prefixes = (
+            f"the {result.selected_option_title} option is recommended",
+            f"{result.selected_option_title} is recommended",
+            f"my recommendation is {result.selected_option_title}",
+        )
+        lowered = summary.lower().lstrip("'\"’‘")
+        for prefix in redundant_prefixes:
+            if lowered.startswith(prefix.lower()):
+                sentence_end = summary.find(".")
+                summary = summary[sentence_end + 1:].strip() if sentence_end >= 0 else ""
+                break
+        reply = f"My recommendation is {result.selected_option_title}."
+        if summary:
+            reply += f" {summary}"
         if result.caveat:
             reply += f"\n\nImportant caveat: {result.caveat}"
         return {"brief": brief.model_dump(mode="json"), "recommendation": result.model_dump(mode="json"), "assistant_reply": reply}
@@ -510,12 +597,8 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
     def route_after_action(state: GraphState) -> str:
         return "evaluate_options" if state["selected_action"]["action"] == "recommend" else "generate_question"
 
-    def retryable(exc: Exception) -> bool:
-        return not isinstance(exc, (DecisionLLMRateLimitError, DecisionLLMBudgetError, DecisionLLMGenerationError))
-
-    retry = RetryPolicy(initial_interval=.5, backoff_factor=2, max_interval=4, max_attempts=2, jitter=True, retry_on=retryable)
     graph = StateGraph(GraphState)
-    graph.add_node("extract_observations", extract, retry_policy=retry)
+    graph.add_node("extract_observations", extract)
     graph.add_node("update_decision_state", update_state)
     graph.add_node("choose_next_action", choose_action)
     graph.add_node("generate_question", formulate_question)

@@ -2,7 +2,7 @@ import { PageHeader } from "@/components/page-header";
 import { ConversationComposer } from "@/components/conversation-composer";
 import { getDecision } from "@/lib/api/decisions";
 import Link from "next/link";
-import { createOption, deleteOption, renameDecision, resolveContradiction, retryWorkflow, reviewBriefItem, reviewOption, sendMessage, updateOption } from "./actions";
+import { completeDecision, createOption, deleteOption, renameDecision, resolveContradiction, retryWorkflow, reviewBriefItem, reviewOption, sendMessage, updateOption } from "./actions";
 
 type BriefItem = {
   id: string;
@@ -20,6 +20,13 @@ type BriefItem = {
   status?: string;
   evidence_message_ids?: string[];
 };
+
+function normalizedLabel(item: BriefItem) {
+  return String(item.value ?? item.name ?? item.statement ?? item.title ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
 
 function ReviewableItems({ decisionId, collection, title, items, readOnly }: {
   decisionId: string;
@@ -118,10 +125,19 @@ export default async function SavedDecisionPage({ params, searchParams }: {
     && decision.messages[decision.messages.length - 1]?.role === "user";
   const retryAvailable = latestAssistant?.structured_data?.retry_available === true && decision.status !== "completed";
   const visibleOptions = decision.options.filter((option) => option.status !== "rejected");
+  const activeCriteria = (brief.criteria ?? []).filter((item) => item.status !== "rejected" && item.status !== "superseded");
+  const criterionByLabel = new Map(activeCriteria.map((item) => [normalizedLabel(item), item]));
+  const displayValues = (brief.values ?? []).map((item) => {
+    const criterion = criterionByLabel.get(normalizedLabel(item));
+    return criterion?.importance ? { ...item, importance: criterion.importance } : item;
+  });
+  const valueLabels = new Set(displayValues.map(normalizedLabel));
+  const remainingCriteria = activeCriteria.filter((item) => !valueLabels.has(normalizedLabel(item)));
+  const displayStatus = decision.status === "completed" ? "completed" : recommendation ? "recommended" : decision.status;
 
   return (
     <section className="mx-auto max-w-5xl">
-      <PageHeader eyebrow="Conversation" title={decision.title} subtitle={`Status: ${decision.status}`} />
+      <PageHeader eyebrow="Conversation" title={decision.title} subtitle={`Status: ${displayStatus}`} />
 
       {searchParams?.retry_error && (
         <div className="mb-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
@@ -145,7 +161,7 @@ export default async function SavedDecisionPage({ params, searchParams }: {
           <div className="flex items-center justify-between gap-3">
             <h3 className="text-base font-semibold text-brand-text">Decision Brief</h3>
             <span className="rounded-lg bg-brand-soft px-2.5 py-1 text-xs font-medium text-brand-muted">
-              {Object.keys(decision.decision_brief).length ? "In progress" : "Gathering"}
+              {decision.status === "completed" ? "Completed" : recommendation ? "Recommended" : Object.keys(decision.decision_brief).length ? "In progress" : "Gathering"}
             </span>
           </div>
           <div className="mt-4 grid gap-2 text-sm">
@@ -202,9 +218,9 @@ export default async function SavedDecisionPage({ params, searchParams }: {
                 {!visibleOptions.length && <p className="text-brand-muted">Being explored in conversation</p>}
               </div>
             </div>
-            <ReviewableItems decisionId={decision.id} collection="values" title="What matters" items={brief.values ?? []} readOnly={decision.status === "completed"} />
+            <ReviewableItems decisionId={decision.id} collection="values" title="What matters" items={displayValues} readOnly={decision.status === "completed"} />
             <ReviewableItems decisionId={decision.id} collection="constraints" title="Constraints" items={brief.constraints ?? []} readOnly={decision.status === "completed"} />
-            <ReviewableItems decisionId={decision.id} collection="criteria" title="Criteria" items={brief.criteria ?? []} readOnly={decision.status === "completed"} />
+            <ReviewableItems decisionId={decision.id} collection="criteria" title="Other criteria" items={remainingCriteria} readOnly={decision.status === "completed"} />
             <ReviewableItems decisionId={decision.id} collection="uncertainties" title="Uncertainties" items={brief.uncertainties ?? []} readOnly={decision.status === "completed"} />
             <ReviewableItems decisionId={decision.id} collection="preference_signals" title="Preference signals" items={brief.preference_signals ?? []} readOnly={decision.status === "completed"} />
             <ReviewableItems decisionId={decision.id} collection="assumptions" title="Assumptions to confirm" items={brief.assumptions ?? []} readOnly={decision.status === "completed"} />
@@ -271,6 +287,14 @@ export default async function SavedDecisionPage({ params, searchParams }: {
             </span>
           </div>
           <p className="mt-3 leading-7 text-brand-muted">{recommendation.summary}</p>
+
+          {decision.status !== "completed" && (
+            <form action={completeDecision.bind(null, decision.id)} className="mt-4">
+              <button className="rounded-lg bg-brand-primary px-4 py-2.5 text-sm font-medium text-white">
+                Mark decision complete
+              </button>
+            </form>
+          )}
 
           {!!recommendation.rationale?.length && (
             <section className="mt-5">

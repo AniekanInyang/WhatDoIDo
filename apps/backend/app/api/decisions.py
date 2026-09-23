@@ -81,6 +81,15 @@ async def rename_decision(
     return await DecisionStore(settings, user).rename(decision_id, values)
 
 
+@router.post("/{decision_id}/complete", response_model=DecisionSummary)
+async def complete_decision(
+    decision_id: UUID,
+    user: CurrentUser,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> DecisionSummary:
+    return await DecisionStore(settings, user).complete(decision_id)
+
+
 @router.post("/{decision_id}/messages", response_model=ConversationTurn, status_code=status.HTTP_201_CREATED)
 async def add_decision_message(
     decision_id: UUID,

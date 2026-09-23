@@ -131,6 +131,12 @@ export function renameDecision(id: string, title: string) {
   });
 }
 
+export function completeDecision(id: string) {
+  return authenticatedFetch<DecisionSummary>(`/decisions/${encodeURIComponent(id)}/complete`, {
+    method: "POST",
+  });
+}
+
 export function createDecisionOption(id: string, values: { title: string; description?: string }) {
   return authenticatedFetch<DecisionOption>(`/decisions/${encodeURIComponent(id)}/options`, {
     method: "POST",

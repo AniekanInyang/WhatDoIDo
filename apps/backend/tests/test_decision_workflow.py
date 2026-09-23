@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -21,14 +22,17 @@ from app.graph.workflow import (
     _clarification_limit,
     _personalized_utility,
     _requests_recommendation,
+    _signals_repeated_question,
     _same_option,
     build_decision_graph,
 )
 from app.llm.decision_assistant import (
     DecisionLLMBudgetError,
+    ExtractionDraft,
     _check_budget,
     _compact_brief,
-    _complete_with_fallback,
+    _compact_extraction_brief,
+    _complete_structured,
     _merge_contextual_answer,
     _normalize_question_payload,
     _normalize_recommendation_payload,
@@ -53,7 +57,84 @@ def stub_question_model(monkeypatch):
 
 def test_duplicate_option_detection_normalizes_and_matches_similar_titles() -> None:
     assert _same_option("Stay at my current company", "Stay at current company")
+    assert _same_option("educational", "Educational tutorial")
     assert not _same_option("Move to Berlin", "Start a local business")
+    assert not _same_option("post", "Post content on TikTok")
+
+
+def test_goal_is_not_persisted_as_an_option(monkeypatch) -> None:
+    async def extracted(*args, **kwargs):
+        return DecisionStatePatch(
+            decision_stakes="low",
+            goal={"value": "Post content on TikTok", "source": "explicit", "confidence": "high"},
+            options=[
+                {"title": "Post content on TikTok", "source": "user_provided"},
+                {"title": "Educational tutorial", "source": "ai_generated"},
+                {"title": "Entertaining skit", "source": "ai_generated"},
+            ],
+        )
+
+    monkeypatch.setattr("app.graph.workflow.extract_decision_patch", extracted)
+    graph = build_decision_graph(Settings(_env_file=None, groq_api_key=None))
+    result = asyncio.run(graph.ainvoke({
+        "decision_id": "content", "user_id": "user-1",
+        "user_message": "post content on TikTok", "message_id": "goal-message",
+        "brief": {}, "existing_options": [], "profile": {},
+    }))
+    assert [option["title"] for option in result["new_options"]] == [
+        "Educational tutorial", "Entertaining skit",
+    ]
+
+
+def test_goal_refinement_is_not_an_option_when_original_goal_is_preserved(monkeypatch) -> None:
+    async def extracted(*args, **kwargs):
+        return DecisionStatePatch(
+            goal={"value": "Post content on TikTok", "source": "explicit", "confidence": "high"},
+            options=[{"title": "Post content on TikTok", "source": "user_provided"}],
+        )
+
+    monkeypatch.setattr("app.graph.workflow.extract_decision_patch", extracted)
+    graph = build_decision_graph(Settings(_env_file=None, groq_api_key=None))
+    result = asyncio.run(graph.ainvoke({
+        "decision_id": "content", "user_id": "user-1",
+        "user_message": "post content on TikTok", "message_id": "refinement-message",
+        "brief": {
+            "goal": {"value": "Decide what to work on today", "source": "explicit", "confidence": "high"},
+        },
+        "existing_options": [], "profile": {},
+    }))
+    assert result["new_options"] == []
+
+
+def test_short_option_selection_resolves_existing_option_without_duplication(monkeypatch) -> None:
+    async def extracted(*args, **kwargs):
+        return DecisionStatePatch(options=[{
+            "title": "educational", "source": "user_provided", "kind": "alternative",
+        }])
+
+    monkeypatch.setattr("app.graph.workflow.extract_decision_patch", extracted)
+    graph = build_decision_graph(Settings(_env_file=None, groq_api_key=None))
+    result = asyncio.run(graph.ainvoke({
+        "decision_id": "content", "user_id": "user-1",
+        "user_message": "educational", "message_id": "selection-message",
+        "brief": {
+            "decision_stakes": "low",
+            "goal": {"value": "Choose TikTok content", "source": "explicit", "confidence": "high"},
+        },
+        "existing_options": [
+            {"id": "education", "title": "Educational tutorial", "status": "confirmed"},
+            {"id": "skit", "title": "Entertaining skit", "status": "confirmed"},
+        ],
+        "profile": {},
+    }))
+    assert result["new_options"] == []
+    assert result["duplicate_options"] == [{
+        "candidate": "educational", "existing": "Educational tutorial",
+    }]
+    assert any(
+        item["value"] == "Selected option: Educational tutorial"
+        for item in result["brief"]["preference_signals"]
+    )
 
 
 def test_all_caps_prompt_gets_a_readable_title() -> None:
@@ -153,6 +234,68 @@ def test_stakes_bound_the_clarification_limit() -> None:
     assert _clarification_limit(DecisionBrief(decision_stakes="high"), 4) == 4
 
 
+def test_low_stakes_turn_limit_stops_discovery_questions() -> None:
+    graph = build_decision_graph(Settings(
+        _env_file=None, groq_api_key=None, decision_max_clarification_turns=8,
+    ))
+    history = [
+        {"question": f"Question {index}?", "action": "ask_clarification"}
+        for index in range(3)
+    ]
+    result = asyncio.run(graph.ainvoke({
+        "decision_id": "bounded", "user_id": "user-1",
+        "user_message": "not sure", "message_id": "turn-limit",
+        "brief": {
+            "decision_stakes": "low",
+            "goal": {"value": "Choose an outfit", "source": "explicit", "confidence": "high"},
+            "question_history": history,
+        },
+        "existing_options": [
+            {"id": "formal", "title": "Formal suit", "status": "confirmed"},
+            {"id": "casual", "title": "Smart casual", "status": "confirmed"},
+        ],
+        "profile": {},
+    }))
+    assert result["selected_action"]["action"] == "evaluate"
+    assert result["selected_action"]["target_field"] == "recommendation_consent"
+
+
+def test_confirmation_after_turn_limit_proceeds_despite_missing_details(monkeypatch) -> None:
+    async def provisional_recommendation(brief, options, settings):
+        return RecommendationResult(
+            selected_option_id="formal", selected_option_title="Formal suit",
+            summary="It is a provisional choice based on the limited information.",
+            rationale=["It is one of the confirmed alternatives."],
+            option_assessments=[
+                {"option_id": "formal", "option_title": "Formal suit", "fit": "mixed"},
+                {"option_id": "casual", "option_title": "Smart casual", "fit": "mixed"},
+            ],
+        )
+
+    monkeypatch.setattr("app.graph.workflow.generate_grounded_recommendation", provisional_recommendation)
+    graph = build_decision_graph(Settings(_env_file=None, groq_api_key=None))
+    result = asyncio.run(graph.ainvoke({
+        "decision_id": "bounded", "user_id": "user-1",
+        "user_message": "yes", "message_id": "consent",
+        "brief": {
+            "decision_stakes": "low",
+            "goal": {"value": "Choose an outfit", "source": "explicit", "confidence": "high"},
+            "next_action": {
+                "action": "evaluate", "category": "evaluation",
+                "target_field": "recommendation_consent", "rationale": "Turn limit reached",
+            },
+        },
+        "existing_options": [
+            {"id": "formal", "title": "Formal suit", "status": "confirmed"},
+            {"id": "casual", "title": "Smart casual", "status": "confirmed"},
+        ],
+        "profile": {},
+    }))
+    assert result["selected_action"]["action"] == "recommend"
+    assert result["recommendation"]["robustness"] == "low"
+    assert "Remaining uncertainty" in result["recommendation"]["caveat"]
+
+
 def test_strict_response_schema_closes_objects_and_requires_every_field() -> None:
     response_format = _strict_response_format("question", QuestionDraft)
     schema = response_format["json_schema"]["schema"]
@@ -162,25 +305,42 @@ def test_strict_response_schema_closes_objects_and_requires_every_field() -> Non
     assert "default" not in schema["properties"]["acknowledges_answer"]
 
 
-def test_json_validation_failure_retries_same_model_once() -> None:
-    calls = []
+def test_json_validation_failure_uses_one_compact_repair() -> None:
+    calls: list[dict] = []
 
     class Completions:
         async def create(self, *, model, **kwargs):
-            calls.append(model)
+            calls.append({"model": model, **kwargs})
             if len(calls) == 1:
                 response = httpx.Response(400, request=httpx.Request("POST", "https://api.groq.com"))
                 raise BadRequestError(
                     "invalid JSON",
                     response=response,
-                    body={"error": {"code": "json_validate_failed"}},
+                    body={"error": {
+                        "code": "json_validate_failed",
+                        "failed_generation": '{"goal":"Choose lunch"}',
+                    }},
                 )
-            return SimpleNamespace(choices=[]), model
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"goal":"Choose lunch"}'))]
+            )
 
     client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
-    _, model = asyncio.run(_complete_with_fallback(client, ["openai/gpt-oss-20b", "fallback"]))
+    _, model, draft, _ = asyncio.run(_complete_structured(
+        client,
+        ["openai/gpt-oss-20b", "fallback"],
+        stage="extraction",
+        schema_name="decision_extraction",
+        response_model=ExtractionDraft,
+        parse=ExtractionDraft.model_validate,
+        messages=[{"role": "system", "content": "a deliberately long original prompt"}],
+        max_completion_tokens=500,
+    ))
     assert model == "openai/gpt-oss-20b"
-    assert calls == ["openai/gpt-oss-20b", "openai/gpt-oss-20b"]
+    assert draft.goal == "Choose lunch"
+    assert [call["model"] for call in calls] == ["openai/gpt-oss-20b", "openai/gpt-oss-20b"]
+    assert calls[1]["response_format"] == {"type": "json_object"}
+    assert "a deliberately long original prompt" not in json.dumps(calls[1]["messages"])
 
 
 def test_compact_brief_excludes_workflow_history_cache_and_evidence() -> None:
@@ -196,6 +356,30 @@ def test_compact_brief_excludes_workflow_history_cache_and_evidence() -> None:
     assert "evidence_message_ids" not in compact["values"][0]
 
 
+def test_extraction_brief_keeps_only_current_semantics() -> None:
+    compact = _compact_extraction_brief({
+        "goal": {"value": "Choose lunch", "id": "goal-id"},
+        "values": [{"value": "Nutrition", "status": "confirmed", "id": "value-id"}],
+        "criteria": [{"name": "Nutrition", "importance": 5, "status": "confirmed"}],
+        "next_action": {
+            "category": "options", "target_field": "options",
+            "question": "Which meals?", "rationale": "large internal rationale",
+        },
+        "assumptions": [{"statement": "A large unused assumption"}],
+        "risks": [{"title": "A large unused risk"}],
+        "readiness": {"score": 0.5, "blockers": ["unused"]},
+        "question_history": [{"question": "unused"}],
+    })
+    assert compact == {
+        "goal": "Choose lunch",
+        "values": ["Nutrition"],
+        "criteria": [{"name": "Nutrition", "importance": 5}],
+        "pending_question": {
+            "category": "options", "target_field": "options", "question": "Which meals?",
+        },
+    }
+
+
 def test_decision_token_budget_blocks_call_before_provider_use() -> None:
     brief = {"llm_usage": {"total_tokens": 950, "budget_tokens": 1_000}}
     settings = Settings(_env_file=None, decision_llm_token_budget=1_000)
@@ -204,21 +388,37 @@ def test_decision_token_budget_blocks_call_before_provider_use() -> None:
     assert brief["llm_usage"]["exhausted"] is True
 
 
-def test_rate_limited_model_falls_back_once_to_next_model() -> None:
+def test_rate_limited_model_waits_and_falls_back_once(monkeypatch) -> None:
     calls = []
+    waits = []
+
+    async def fake_sleep(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr("app.llm.decision_assistant.asyncio.sleep", fake_sleep)
 
     class Completions:
         async def create(self, *, model, **kwargs):
             calls.append(model)
             if model == "primary":
-                response = httpx.Response(429, request=httpx.Request("POST", "https://api.groq.com"))
+                response = httpx.Response(
+                    429, request=httpx.Request("POST", "https://api.groq.com"),
+                    headers={"retry-after": "2", "x-ratelimit-remaining-tokens": "0"},
+                )
                 raise RateLimitError("limited", response=response, body={})
-            return SimpleNamespace(choices=[]), model
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"goal":"Choose lunch"}'))]
+            )
 
     client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
-    completion, model = asyncio.run(_complete_with_fallback(client, ["primary", "fallback"]))
+    _, model, _, _ = asyncio.run(_complete_structured(
+        client, ["primary", "fallback"], stage="extraction",
+        schema_name="decision_extraction", response_model=ExtractionDraft,
+        parse=ExtractionDraft.model_validate, messages=[], max_completion_tokens=500,
+    ))
     assert model == "fallback"
     assert calls == ["primary", "fallback"]
+    assert waits == [2.0]
 
 
 def test_policy_uses_only_supplied_users_profile() -> None:
@@ -261,6 +461,12 @@ def test_recommendation_intent_requires_an_explicit_signal() -> None:
     assert _requests_recommendation("Go ahead and recommend one")
     assert _requests_recommendation("Nothing else")
     assert not _requests_recommendation("Stability is important to me")
+
+
+def test_repeated_question_signal_is_detected() -> None:
+    assert _signals_repeated_question("I already answered you")
+    assert _signals_repeated_question("Please stop repeating the same question")
+    assert not _signals_repeated_question("My answer is stability")
 
 
 def test_ready_graph_generates_recommendation_after_user_confirmation(monkeypatch) -> None:
@@ -307,7 +513,7 @@ def test_ready_graph_generates_recommendation_after_user_confirmation(monkeypatc
         )
     )
     assert result["selected_action"]["action"] == "recommend"
-    assert result["brief"]["phase"] == "completed"
+    assert result["brief"]["phase"] == "recommended"
     assert result["recommendation"]["selected_option_id"] == "option-1"
     assert result["recommendation"]["sensitivity_analysis"][0]["likely_winner_option_id"] == "option-2"
 
@@ -398,7 +604,7 @@ def test_failed_recommendation_resumes_from_checkpointed_node(monkeypatch) -> No
         asyncio.run(graph.ainvoke(payload, config=config))
     provider_available = True
     resumed = asyncio.run(graph.ainvoke(None, config=config))
-    assert resumed["brief"]["phase"] == "completed"
+    assert resumed["brief"]["phase"] == "recommended"
     assert resumed["recommendation"]["selected_option_id"] == "option-1"
 
 
@@ -538,7 +744,7 @@ def test_which_should_i_requests_an_early_recommendation(monkeypatch) -> None:
         "profile": {},
     }))
     assert result["selected_action"]["action"] == "recommend"
-    assert result["brief"]["phase"] == "completed"
+    assert result["brief"]["phase"] == "recommended"
 
 
 def test_failed_gap_extraction_does_not_repeat_identical_question() -> None:

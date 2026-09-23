@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     extraction_max_tokens: int = 500
     question_max_tokens: int = 300
     recommendation_max_tokens: int = 1_500
+    llm_stage_delay_seconds: float = 0.75
     frontend_origins: str = "http://localhost:3000"
 
     model_config = SettingsConfigDict(

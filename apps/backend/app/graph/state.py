@@ -171,7 +171,7 @@ class LLMUsage(BaseModel):
 class DecisionBrief(BaseModel):
     schema_version: int = 2
     revision: int = 0
-    phase: Literal["intake", "clarifying", "evaluating", "completed"] = "intake"
+    phase: Literal["intake", "clarifying", "evaluating", "recommended", "completed"] = "intake"
     decision_stakes: DecisionStakes | None = None
     goal: Fact | None = None
     domain: Fact | None = None

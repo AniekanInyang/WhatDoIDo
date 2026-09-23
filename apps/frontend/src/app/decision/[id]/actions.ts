@@ -2,6 +2,7 @@
 
 import {
   addDecisionMessage,
+  completeDecision as completeDecisionApi,
   createDecisionOption as createOptionApi,
   deleteDecisionOption as deleteOptionApi,
   renameDecision as renameDecisionApi,
@@ -20,6 +21,12 @@ export async function renameDecision(id: string, formData: FormData) {
   if (!title) return;
 
   await renameDecisionApi(id, title);
+  revalidatePath(`/decision/${id}`);
+  revalidatePath("/history");
+}
+
+export async function completeDecision(id: string) {
+  await completeDecisionApi(id);
   revalidatePath(`/decision/${id}`);
   revalidatePath("/history");
 }
