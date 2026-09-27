@@ -70,6 +70,7 @@ class OptionObservation(BaseModel):
     description: str | None = Field(default=None, max_length=2_000)
     source: Literal["user_provided", "ai_extracted", "ai_generated"] = "ai_extracted"
     kind: Literal["alternative", "context"] = "alternative"
+    specificity: Literal["direction", "actionable"] = "actionable"
 
 
 class DecisionStatePatch(BaseModel):
@@ -146,6 +147,7 @@ class RecommendationResult(BaseModel):
     selected_option_id: str
     selected_option_title: str
     summary: str
+    concrete_example: str | None = None
     rationale: list[str] = Field(min_length=1)
     option_assessments: list[OptionAssessment] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)

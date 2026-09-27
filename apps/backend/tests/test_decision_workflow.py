@@ -12,7 +12,9 @@ from app.core.config import Settings
 from app.core.auth import AuthenticatedUser
 from app.graph.state import (
     ClarificationProfile,
+    DecisionBrief,
     InformationGap,
+    OptionObservation,
     PolicyActionStats,
     QuestionDraft,
     RecommendationResult,
@@ -20,6 +22,7 @@ from app.graph.state import (
 )
 from app.graph.workflow import (
     _clarification_limit,
+    _gaps,
     _personalized_utility,
     _requests_recommendation,
     _signals_repeated_question,
@@ -29,14 +32,24 @@ from app.graph.workflow import (
 from app.llm.decision_assistant import (
     DecisionLLMBudgetError,
     ExtractionDraft,
+    RecommendationDraft,
+    _bind_selected_option,
     _check_budget,
     _compact_brief,
     _compact_extraction_brief,
+    _confirmed_actionable_selection,
+    _extraction_patch_from_draft,
     _complete_structured,
     _merge_contextual_answer,
     _normalize_question_payload,
     _normalize_recommendation_payload,
+    _replace_option_references,
+    _preserve_opening_decision,
+    _question_advances_target,
+    _sanitize_recommendation,
+    _short_option_label,
     _strict_response_format,
+    _validate_recommendation_selection,
 )
 from app.services.decisions import DecisionStore
 
@@ -60,6 +73,33 @@ def test_duplicate_option_detection_normalizes_and_matches_similar_titles() -> N
     assert _same_option("educational", "Educational tutorial")
     assert not _same_option("Move to Berlin", "Start a local business")
     assert not _same_option("post", "Post content on TikTok")
+
+
+def test_paraphrased_selection_is_not_persisted_as_another_option() -> None:
+    draft = ExtractionDraft(
+        selected_option_title="Gourmet Dessert",
+        preference_signals=["Prefers something sweet and indulgent"],
+        options=[{
+            "title": "Sweet indulgence",
+            "kind": "alternative",
+            "specificity": "actionable",
+        }],
+    )
+    bound = _bind_selected_option(draft, [
+        {"id": "dessert", "title": "Gourmet Dessert", "status": "candidate"},
+        {
+            "id": "cheese",
+            "title": "Specialty Cheese or Charcuterie Board",
+            "status": "candidate",
+        },
+    ])
+    patch = _extraction_patch_from_draft(bound, "sweet-reply")
+
+    assert patch.options == []
+    assert [str(item.value) for item in patch.preference_signals] == [
+        "Prefers something sweet and indulgent",
+        "Selected option: Gourmet Dessert",
+    ]
 
 
 def test_goal_is_not_persisted_as_an_option(monkeypatch) -> None:
@@ -149,6 +189,103 @@ def test_compound_priority_answer_is_saved_as_distinct_values() -> None:
         {"next_action": {"category": "values"}},
     )
     assert [fact.value for fact in patch.values] == ["mental health", "financial stability"]
+
+
+def test_weather_priority_creates_context_gap_until_conditions_are_known() -> None:
+    brief = DecisionBrief.model_validate({
+        "decision_stakes": "low",
+        "goal": {"value": "Choose what to wear tomorrow", "source": "explicit", "confidence": "high"},
+        "values": [{"value": "weather", "source": "explicit", "confidence": "high"}],
+    })
+    assert any(gap.key == "weather_context" for gap in _gaps(brief, 2))
+    brief.constraints.append(brief.values[0].model_copy(update={"value": "55 degrees with a 20-minute walk"}))
+    assert not any(gap.key == "weather_context" for gap in _gaps(brief, 2))
+
+
+def test_context_answer_is_saved_without_replacing_goal() -> None:
+    patch = _merge_contextual_answer(
+        DecisionStatePatch(),
+        "Cold and rainy, and I will walk for 20 minutes",
+        "message-weather",
+        {"next_action": {"category": "context", "target_field": "weather_context"}},
+    )
+    assert [fact.value for fact in patch.constraints] == [
+        "Cold and rainy, and I will walk for 20 minutes"
+    ]
+    assert patch.goal is None
+
+
+def test_opening_decision_survives_an_incomplete_model_extraction() -> None:
+    fallback = DecisionStatePatch.model_validate({
+        "goal": {
+            "value": "What birthday gift should I get my best friend?",
+            "source": "explicit",
+            "confidence": "high",
+            "evidence_message_ids": ["message-gift"],
+        },
+    })
+    incomplete = DecisionStatePatch(is_decision_input=False, non_decision_reason="Unclear")
+
+    result = _preserve_opening_decision(incomplete, fallback, {})
+
+    assert result.goal is not None
+    assert result.goal.value == "What birthday gift should I get my best friend?"
+    assert result.is_decision_input is True
+    assert result.non_decision_reason is None
+
+
+def test_question_must_advance_its_selected_target() -> None:
+    assert not _question_advances_target(QuestionDraft(
+        question="What is the most important reason you want to buy a gift?",
+        target_field="options",
+        expected_answer_type="list_of_options",
+    ))
+    assert _question_advances_target(QuestionDraft(
+        question="That sounds thoughtful. What gift ideas are you already considering?",
+        target_field="options",
+        expected_answer_type="list_of_options",
+    ))
+    assert not _question_advances_target(QuestionDraft(
+        question="Why do you want help?",
+        target_field="goal",
+        expected_answer_type="decision_statement",
+    ))
+
+
+def test_user_facing_recommendation_replaces_option_ids_and_deduplicates() -> None:
+    selected_id = "79162cf5-1111-4111-8111-111111111111"
+    alternate_id = "8b1ed06c-2222-4222-8222-222222222222"
+    options = {
+        selected_id: {"title": "Polished, business-casual look that balances comfort with a professional appearance"},
+        alternate_id: {"title": "Relaxed, casual look that maximizes comfort"},
+    }
+    result = RecommendationResult.model_validate({
+        "selected_option_id": selected_id,
+        "selected_option_title": options[selected_id]["title"],
+        "summary": "Option 79162cf5 best matches the user's preference.",
+        "concrete_example": "Try Option 79162cf5 with breathable fabric.",
+        "rationale": [
+            "Option 79162cf5 balances comfort and professionalism.",
+            "Option 79162cf5 balances comfort and professionalism.",
+            "Option 8b1ed06c is more relaxed.",
+        ],
+        "assumptions": ["You prefer sweet flavors over savory ones."],
+        "unresolved_uncertainties": [
+            "Your specific flavor preference (sweet vs. savory).",
+            "Whether you are buying for yourself or others.",
+        ],
+        "option_assessments": [],
+        "alternate_recommendation": "Choose Option 8b1ed06c if comfort matters more.",
+    })
+    cleaned = _sanitize_recommendation(result, options)
+    assert "79162cf5" not in cleaned.summary
+    assert "79162cf5" not in (cleaned.concrete_example or "")
+    assert "8b1ed06c" not in (cleaned.alternate_recommendation or "")
+    assert "the user" not in cleaned.summary.lower()
+    assert len(cleaned.rationale) == 2
+    assert cleaned.unresolved_uncertainties == ["Whether you are buying for yourself or others."]
+    assert _short_option_label(options[selected_id]["title"]) == "Polished, business-casual look"
+    assert _replace_option_references("Option 8b1ed06c is viable", options) == "Relaxed, casual look is viable"
 
 
 def test_selected_priority_is_weighted_without_asking_for_importance_again() -> None:
@@ -454,7 +591,8 @@ def test_graph_builds_state_and_selects_a_clarification() -> None:
     )
     assert result["brief"]["goal"]["value"] == "Should I accept the new role?"
     assert result["selected_action"]["action"] == "ask_clarification"
-    assert result["selected_action"]["category"] == "options"
+    assert result["selected_action"]["category"] == "preferences"
+    assert result["selected_action"]["target_field"] == "decision_context"
 
 
 def test_recommendation_intent_requires_an_explicit_signal() -> None:
@@ -666,7 +804,12 @@ def test_meal_conversation_accepts_and_separated_options_and_short_priority() ->
     first = asyncio.run(graph.ainvoke({
         "decision_id": "meal", "user_id": "user-1",
         "user_message": "what should I eat today", "message_id": "one",
-        "brief": {}, "existing_options": [], "profile": {},
+        "brief": {
+            "preference_signals": [{
+                "value": "I am choosing dinner for myself", "source": "explicit", "confidence": "high",
+            }],
+        },
+        "existing_options": [], "profile": {},
     }))
     assert first["selected_action"]["category"] == "options"
 
@@ -756,6 +899,9 @@ def test_failed_gap_extraction_does_not_repeat_identical_question() -> None:
         "message_id": "message-options",
         "brief": {
             "goal": {"value": "Choose a job", "source": "explicit", "confidence": "high"},
+            "preference_signals": [{
+                "value": "I want meaningful work", "source": "explicit", "confidence": "high",
+            }],
             "next_action": {
                 "action": "ask_clarification", "category": "options",
                 "question": "What alternatives are you considering, including keeping things as they are?",
@@ -885,7 +1031,12 @@ def test_assistant_suggested_options_are_returned_for_persistence(monkeypatch) -
     result = asyncio.run(graph.ainvoke({
         "decision_id": "workwear", "user_id": "user-1",
         "user_message": "What should I wear to work?", "message_id": "initial",
-        "brief": {}, "existing_options": [], "profile": {},
+        "brief": {
+            "preference_signals": [{
+                "value": "The office is client-facing", "source": "explicit", "confidence": "high",
+            }],
+        },
+        "existing_options": [], "profile": {},
     }))
     assert [option["title"] for option in result["new_options"]] == [
         "Formal suit", "Smart casual outfit",
@@ -913,7 +1064,7 @@ def test_policy_selects_target_before_question_is_generated(monkeypatch) -> None
         "user_message": "Choose a job", "message_id": "message-1",
         "brief": {}, "existing_options": [], "profile": {},
     }))
-    assert captured["target_field"] == "options"
+    assert captured["target_field"] == "decision_context"
     assert captured["policy_question"] is None
     assert result["assistant_reply"] == "Which parts of stability matter most for this job choice?"
 
@@ -925,6 +1076,51 @@ def test_policy_reward_requires_the_requested_target_to_change() -> None:
     action = before["next_action"]
     assert not DecisionStore._target_was_resolved(action, before, unresolved, [])
     assert DecisionStore._target_was_resolved(action, before, resolved, [])
+
+
+def test_selected_direction_requires_concrete_candidates_before_evaluation() -> None:
+    brief = DecisionBrief.model_validate({
+        "goal": {"value": "Choose a birthday gift", "source": "explicit", "confidence": "high"},
+        "values": [{"value": "sentimental", "source": "explicit", "confidence": "high"}],
+        "preference_signals": [{
+            "value": "Selected option: Personalized keepsake",
+            "source": "explicit",
+            "confidence": "high",
+        }],
+    })
+    gaps = _gaps(brief, 0, selected_direction="Personalized keepsake")
+    concrete_gap = next(gap for gap in gaps if gap.key == "concrete_options")
+    assert "within that direction" in concrete_gap.reason
+
+
+def test_confirmed_selection_ignores_broad_direction_and_binds_concrete_item() -> None:
+    options = [
+        {
+            "id": "direction", "title": "Personalized keepsake", "status": "confirmed",
+            "metadata": {"specificity": "direction"},
+        },
+        {
+            "id": "photo-book", "title": "Custom photo book", "status": "confirmed",
+            "metadata": {"specificity": "actionable"},
+        },
+        {
+            "id": "engraved", "title": "Engraved bracelet", "status": "confirmed",
+            "metadata": {"specificity": "actionable"},
+        },
+    ]
+    direction_only = {"preference_signals": [{"value": "Selected option: Personalized keepsake"}]}
+    assert _confirmed_actionable_selection(direction_only, options) is None
+
+    concrete = {"preference_signals": [{"value": "Selected option: Custom photo book"}]}
+    selected = _confirmed_actionable_selection(concrete, options)
+    assert selected and selected["id"] == "photo-book"
+
+    draft = RecommendationDraft(
+        selected_option_id="engraved",
+        summary="A bracelet would work.",
+    )
+    with pytest.raises(ValueError, match="confirmed option selection"):
+        _validate_recommendation_selection(draft, selected)
 
 
 def test_third_criteria_attempt_can_confirm_existing_values_without_repeating() -> None:
@@ -951,3 +1147,75 @@ def test_third_criteria_attempt_can_confirm_existing_values_without_repeating() 
     assert result["brief"]["criteria"][0]["name"] == "nutrition"
     assert result["brief"]["criteria"][0]["status"] == "confirmed"
     assert result["selected_action"]["category"] == "evaluation"
+
+
+def test_recommend_now_infers_options_and_recommends_without_more_questions(monkeypatch) -> None:
+    async def extracted(*args, **kwargs):
+        return DecisionStatePatch()
+
+    async def inferred(*args, **kwargs):
+        return [
+            OptionObservation(
+                title="Custom photo book",
+                description="A compact book built from shared photos and captions.",
+                source="ai_generated",
+                specificity="actionable",
+            ),
+            OptionObservation(
+                title="Engraved bracelet",
+                description="A wearable keepsake with a short personal inscription.",
+                source="ai_generated",
+                specificity="actionable",
+            ),
+        ]
+
+    async def recommended(brief, options, settings):
+        assert len(options) == 2
+        assert all(str(option["id"]).startswith("provisional-") for option in options)
+        return RecommendationResult(
+            selected_option_id=options[0]["id"],
+            selected_option_title=options[0]["title"],
+            summary="It is the strongest provisional fit for the limited context.",
+            rationale=["It directly answers the gift decision with a concrete item."],
+            option_assessments=[
+                {
+                    "option_id": option["id"],
+                    "option_title": option["title"],
+                    "fit": "strong" if index == 0 else "mixed",
+                }
+                for index, option in enumerate(options)
+            ],
+            robustness="low",
+        )
+
+    monkeypatch.setattr("app.graph.workflow.extract_decision_patch", extracted)
+    monkeypatch.setattr("app.graph.workflow.generate_immediate_options", inferred)
+    monkeypatch.setattr("app.graph.workflow.generate_grounded_recommendation", recommended)
+
+    graph = build_decision_graph(Settings(_env_file=None, groq_api_key=None))
+    result = asyncio.run(graph.ainvoke({
+        "decision_id": "early-exit",
+        "user_id": "user-1",
+        "user_message": "Give me a recommendation now",
+        "message_id": "force-recommendation",
+        "brief": {
+            "decision_stakes": "low",
+            "goal": {
+                "value": "Choose a birthday gift",
+                "source": "explicit",
+                "confidence": "high",
+            },
+        },
+        "existing_options": [],
+        "profile": {},
+    }))
+
+    assert result["selected_action"]["action"] == "recommend"
+    assert len(result["new_options"]) == 2
+    assert result["recommendation"]["selected_option_title"] == "Custom photo book"
+    assert result["recommendation"]["robustness"] == "low"
+    assert result["assistant_reply"].startswith("I recommend Custom photo book")
+    assert any(
+        "alternatives used for this immediate recommendation were inferred" in item["statement"]
+        for item in result["brief"]["assumptions"]
+    )

@@ -512,6 +512,7 @@ class DecisionStore:
         persisted_option_ids = [] if result.get("direction_changed") else [
             str(option["id"]) for option in options if option.get("status") != "rejected"
         ]
+        option_id_map = {option_id: option_id for option_id in persisted_option_ids}
         for position, option in enumerate(result.get("new_options", []), start=len(options)):
             rows = await self._request(
                 client,
@@ -524,17 +525,41 @@ class DecisionStore:
                     "description": option.get("description"),
                     "position": position,
                     "source": option.get("source", "ai_extracted"),
-                    "metadata": {"evidence_message_id": str(user_message.id)},
+                    "metadata": {
+                        "evidence_message_id": str(user_message.id),
+                        "specificity": option.get("specificity", "actionable"),
+                    },
                 },
                 prefer_representation=True,
                 trusted_backend=True,
                 prefer="resolution=merge-duplicates",
             )
-            persisted_option_ids.append(str(rows[0]["id"]))
+            persisted_id = str(rows[0]["id"])
+            persisted_option_ids.append(persisted_id)
+            if option.get("id"):
+                option_id_map[str(option["id"])] = persisted_id
 
         updated_brief = result["brief"]
         updated_brief["option_ids"] = persisted_option_ids
         recommendation = result.get("recommendation")
+        if recommendation and option_id_map:
+            recommendation["selected_option_id"] = option_id_map.get(
+                str(recommendation.get("selected_option_id")),
+                str(recommendation.get("selected_option_id")),
+            )
+            for assessment in recommendation.get("option_assessments", []):
+                assessment["option_id"] = option_id_map.get(
+                    str(assessment.get("option_id")), str(assessment.get("option_id"))
+                )
+            for driver in recommendation.get("sensitivity_analysis", []):
+                winner = driver.get("likely_winner_option_id")
+                if winner is not None:
+                    driver["likely_winner_option_id"] = option_id_map.get(str(winner), str(winner))
+            for risk in recommendation.get("key_risks", []):
+                risk["option_ids"] = [
+                    option_id_map.get(str(option_id), str(option_id))
+                    for option_id in risk.get("option_ids", [])
+                ]
         phase_status = {
             "clarifying": "exploring",
             "evaluating": "evaluating",
