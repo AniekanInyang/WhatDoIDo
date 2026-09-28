@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     decision_max_clarification_turns: int = 8
     extraction_max_tokens: int = 500
     question_max_tokens: int = 300
-    recommendation_max_tokens: int = 1_500
+    recommendation_max_tokens: int = 900
     llm_stage_delay_seconds: float = 0.75
     frontend_origins: str = "http://localhost:3000"
 

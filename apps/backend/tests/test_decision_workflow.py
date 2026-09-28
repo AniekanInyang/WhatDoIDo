@@ -47,6 +47,7 @@ from app.llm.decision_assistant import (
     _preserve_opening_decision,
     _question_advances_target,
     _sanitize_recommendation,
+    _safe_completion_token_limit,
     _short_option_label,
     _strict_response_format,
     _validate_recommendation_selection,
@@ -181,6 +182,26 @@ def test_all_caps_prompt_gets_a_readable_title() -> None:
     assert DecisionStore._title_from_prompt("WHAT SHOULD I COOK TOMORROW") == "What should I cook tomorrow"
 
 
+def test_normalized_opening_goal_replaces_typo_in_provisional_title() -> None:
+    brief = {
+        "goal": {
+            "value": "What should I wea r this weekend?",
+            "source": "explicit",
+            "confidence": "high",
+        }
+    }
+
+    assert DecisionStore._title_from_brief(brief) == "What should I wear this weekend"
+
+
+def test_provisional_title_repairs_an_accidentally_split_word() -> None:
+    assert DecisionStore._title_from_prompt("what should I wea r today") == "What should I wear today"
+
+
+def test_provisional_title_preserves_single_letter_choice_labels() -> None:
+    assert DecisionStore._title_from_prompt("Should I choose plan B?") == "Should I choose plan B"
+
+
 def test_compound_priority_answer_is_saved_as_distinct_values() -> None:
     patch = _merge_contextual_answer(
         DecisionStatePatch(),
@@ -245,6 +266,16 @@ def test_question_must_advance_its_selected_target() -> None:
         target_field="options",
         expected_answer_type="list_of_options",
     ))
+    assert _question_advances_target(QuestionDraft(
+        question="Dinner sounds nice. What would you feel best wearing to it?",
+        target_field="options",
+        expected_answer_type="list_of_options",
+    ))
+    assert not _question_advances_target(QuestionDraft(
+        question="What matters most to you when choosing what to wear?",
+        target_field="options",
+        expected_answer_type="list_of_options",
+    ))
     assert not _question_advances_target(QuestionDraft(
         question="Why do you want help?",
         target_field="goal",
@@ -263,7 +294,7 @@ def test_user_facing_recommendation_replaces_option_ids_and_deduplicates() -> No
         "selected_option_id": selected_id,
         "selected_option_title": options[selected_id]["title"],
         "summary": "Option 79162cf5 best matches the user's preference.",
-        "concrete_example": "Try Option 79162cf5 with breathable fabric.",
+        "concrete_example": "For example: Option 79162cf5 with breathable fabric.",
         "rationale": [
             "Option 79162cf5 balances comfort and professionalism.",
             "Option 79162cf5 balances comfort and professionalism.",
@@ -280,6 +311,7 @@ def test_user_facing_recommendation_replaces_option_ids_and_deduplicates() -> No
     cleaned = _sanitize_recommendation(result, options)
     assert "79162cf5" not in cleaned.summary
     assert "79162cf5" not in (cleaned.concrete_example or "")
+    assert cleaned.concrete_example == "Polished, business-casual look with breathable fabric"
     assert "8b1ed06c" not in (cleaned.alternate_recommendation or "")
     assert "the user" not in cleaned.summary.lower()
     assert len(cleaned.rationale) == 2
@@ -400,11 +432,12 @@ def test_low_stakes_turn_limit_stops_discovery_questions() -> None:
 def test_confirmation_after_turn_limit_proceeds_despite_missing_details(monkeypatch) -> None:
     async def provisional_recommendation(brief, options, settings):
         return RecommendationResult(
-            selected_option_id="formal", selected_option_title="Formal suit",
+            selected_option_id="formal", selected_option_title="Formal dress",
             summary="It is a provisional choice based on the limited information.",
+            concrete_example="A floor-length emerald green satin gown with a structured bodice",
             rationale=["It is one of the confirmed alternatives."],
             option_assessments=[
-                {"option_id": "formal", "option_title": "Formal suit", "fit": "mixed"},
+                {"option_id": "formal", "option_title": "Formal dress", "fit": "mixed"},
                 {"option_id": "casual", "option_title": "Smart casual", "fit": "mixed"},
             ],
         )
@@ -423,7 +456,7 @@ def test_confirmation_after_turn_limit_proceeds_despite_missing_details(monkeypa
             },
         },
         "existing_options": [
-            {"id": "formal", "title": "Formal suit", "status": "confirmed"},
+            {"id": "formal", "title": "Formal dress", "status": "confirmed"},
             {"id": "casual", "title": "Smart casual", "status": "confirmed"},
         ],
         "profile": {},
@@ -431,6 +464,10 @@ def test_confirmation_after_turn_limit_proceeds_despite_missing_details(monkeypa
     assert result["selected_action"]["action"] == "recommend"
     assert result["recommendation"]["robustness"] == "low"
     assert "Remaining uncertainty" in result["recommendation"]["caveat"]
+    assert result["assistant_reply"].startswith(
+        "I recommend A floor-length emerald green satin gown with a structured bodice."
+    )
+    assert "I recommend Formal dress" not in result["assistant_reply"]
 
 
 def test_strict_response_schema_closes_objects_and_requires_every_field() -> None:
@@ -556,6 +593,39 @@ def test_rate_limited_model_waits_and_falls_back_once(monkeypatch) -> None:
     assert model == "fallback"
     assert calls == ["primary", "fallback"]
     assert waits == [2.0]
+
+
+def test_qwen_completion_limit_stays_below_provider_otpm_ceiling() -> None:
+    assert _safe_completion_token_limit("qwen/qwen3.8-27b", 1_500) == 900
+    assert _safe_completion_token_limit("qwen/another-model", 700) == 700
+    assert _safe_completion_token_limit("openai/gpt-oss-20b", 1_500) == 1_500
+
+
+def test_recommendation_requires_a_concrete_user_facing_choice() -> None:
+    with pytest.raises(ValueError):
+        RecommendationDraft(
+            selected_option_id="semi-formal",
+            summary="A semi-formal outfit fits the dinner.",
+        )
+
+
+def test_structured_completion_applies_model_specific_output_limit() -> None:
+    calls = []
+
+    class Completions:
+        async def create(self, *, model, **kwargs):
+            calls.append({"model": model, **kwargs})
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content='{"goal":"Choose lunch"}'))]
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    asyncio.run(_complete_structured(
+        client, ["qwen/qwen3.8-27b"], stage="extraction",
+        schema_name="decision_extraction", response_model=ExtractionDraft,
+        parse=ExtractionDraft.model_validate, messages=[], max_completion_tokens=1_500,
+    ))
+    assert calls[0]["max_completion_tokens"] == 900
 
 
 def test_policy_uses_only_supplied_users_profile() -> None:
@@ -1118,6 +1188,7 @@ def test_confirmed_selection_ignores_broad_direction_and_binds_concrete_item() -
     draft = RecommendationDraft(
         selected_option_id="engraved",
         summary="A bracelet would work.",
+        concrete_example="An engraved bracelet with her initials and a meaningful date",
     )
     with pytest.raises(ValueError, match="confirmed option selection"):
         _validate_recommendation_selection(draft, selected)

@@ -13,6 +13,7 @@ from psycopg import Error as PsycopgError
 
 from app.core.auth import AuthenticatedUser
 from app.core.config import Settings
+from app.core.text import normalize_decision_wording
 from app.models.decision import (
     ConversationTurn,
     DecisionCreate,
@@ -149,11 +150,18 @@ class DecisionStore:
     ) -> None:
         """Run the first AI turn after the create response has been sent."""
         async with httpx.AsyncClient(timeout=10.0) as client:
-            await self._run_conversation_turn(client, decision_id, user_message, {}, [])
+            await self._run_conversation_turn(
+                client,
+                decision_id,
+                user_message,
+                {},
+                [],
+                update_title_from_goal=True,
+            )
 
     @staticmethod
     def _title_from_prompt(prompt: str) -> str:
-        normalized = " ".join(prompt.strip().split())
+        normalized = normalize_decision_wording(prompt)
         if any(char.isalpha() for char in normalized) and normalized == normalized.upper():
             normalized = normalized.lower()
         normalized = normalized[:1].upper() + normalized[1:]
@@ -163,6 +171,17 @@ class DecisionStore:
         if len(words) > 8:
             title += "…"
         return title
+
+    @classmethod
+    def _title_from_brief(cls, brief: dict[str, Any]) -> str | None:
+        """Build the permanent title from the agent's normalized opening goal."""
+        goal = brief.get("goal")
+        if not isinstance(goal, dict):
+            return None
+        value = goal.get("value")
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return cls._title_from_prompt(value)
 
     async def _insert_message(
         self,
@@ -290,6 +309,8 @@ class DecisionStore:
         user_message: DecisionMessage,
         brief: dict[str, Any],
         options: list[dict[str, Any]],
+        *,
+        update_title_from_goal: bool = False,
     ) -> DecisionMessage:
         profile = await self._load_policy_profile(client)
         payload = {
@@ -361,7 +382,13 @@ class DecisionStore:
         await self._save_policy_profile(client, profile)
         try:
             return await self._persist_graph_result(
-                client, decision_id, user_message, options, profile, result
+                client,
+                decision_id,
+                user_message,
+                options,
+                profile,
+                result,
+                update_title_from_goal=update_title_from_goal,
             )
         except Exception:
             return await self._insert_message(
@@ -488,6 +515,8 @@ class DecisionStore:
                 [option.model_dump(mode="json") for option in decision.options],
                 profile,
                 result,
+                update_title_from_goal=True,
+                remove_resolved_errors=True,
             )
 
     async def _persist_graph_result(
@@ -498,6 +527,9 @@ class DecisionStore:
         options: list[dict[str, Any]],
         profile: ClarificationProfile,
         result: dict[str, Any],
+        *,
+        update_title_from_goal: bool = False,
+        remove_resolved_errors: bool = False,
     ) -> DecisionMessage:
 
         if result.get("direction_changed"):
@@ -630,18 +662,26 @@ class DecisionStore:
                 trusted_backend=True,
                 prefer="resolution=ignore-duplicates",
             )
+        decision_update = {
+            "decision_brief": updated_brief,
+            "status": phase_status,
+            **({"recommendation": recommendation} if recommendation else {}),
+        }
+        if update_title_from_goal:
+            normalized_title = self._title_from_brief(updated_brief)
+            if normalized_title:
+                decision_update["title"] = normalized_title
+
         await self._request(
             client,
             "PATCH",
             "decisions",
             params={"id": f"eq.{decision_id}", "user_id": f"eq.{self.user.id}"},
-            json={
-                "decision_brief": updated_brief,
-                "status": phase_status,
-                **({"recommendation": recommendation} if recommendation else {}),
-            },
+            json=decision_update,
             trusted_backend=True,
         )
+        if remove_resolved_errors:
+            await self._remove_resolved_workflow_errors(client, decision_id)
         return await self._insert_message(
             client,
             decision_id,
@@ -655,6 +695,44 @@ class DecisionStore:
                 "workflow_error": result.get("recommendation_error"),
             },
         )
+
+    async def _remove_resolved_workflow_errors(
+        self,
+        client: httpx.AsyncClient,
+        decision_id: UUID,
+    ) -> None:
+        """Remove transient failure messages once a retry completes successfully."""
+        rows = await self._request(
+            client,
+            "GET",
+            "decision_messages",
+            params={
+                "decision_id": f"eq.{decision_id}",
+                "role": "eq.assistant",
+                "select": "id,structured_data",
+            },
+            trusted_backend=True,
+        )
+        retryable_errors = {
+            "rate_limited",
+            "question_unavailable",
+            "retryable",
+            "persistence",
+        }
+        for row in rows:
+            metadata = row.get("structured_data") or {}
+            if metadata.get("workflow_error") not in retryable_errors:
+                continue
+            await self._request(
+                client,
+                "DELETE",
+                "decision_messages",
+                params={
+                    "id": f"eq.{row['id']}",
+                    "decision_id": f"eq.{decision_id}",
+                },
+                trusted_backend=True,
+            )
 
     async def _record_state_event(
         self,

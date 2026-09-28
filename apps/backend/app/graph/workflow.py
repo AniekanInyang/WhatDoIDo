@@ -699,13 +699,11 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
                 sentence_end = summary.find(".")
                 summary = summary[sentence_end + 1:].strip() if sentence_end >= 0 else ""
                 break
-        reply = f"I recommend {_short_option_label(result.selected_option_title)}."
+        concrete_recommendation = (result.concrete_example or "").strip().rstrip(".")
+        recommendation_label = concrete_recommendation or _short_option_label(result.selected_option_title)
+        reply = f"I recommend {recommendation_label}."
         if summary:
             reply += f" {summary}"
-        if result.concrete_example:
-            example = result.concrete_example.strip().rstrip(".")
-            if example:
-                reply += f" For example: {example}."
         return {"brief": brief.model_dump(mode="json"), "recommendation": result.model_dump(mode="json"), "assistant_reply": reply}
 
     def route_after_action(state: GraphState) -> str:

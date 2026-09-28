@@ -135,6 +135,9 @@ export default async function SavedDecisionPage({ params, searchParams }: {
     && !retryAvailable
     && hasCompletedExchange;
   const displayText = (value: string | null | undefined) => resolveOptionReferences(value, visibleOptions);
+  const recommendationTitle = recommendation?.concrete_example
+    ? displayText(recommendation.concrete_example)
+    : shortOptionLabel(recommendation?.selected_option_title ?? "Recommendation");
   const activeCriteria = (brief.criteria ?? []).filter((item) => item.status !== "rejected" && item.status !== "superseded");
   const criterionByLabel = new Map(activeCriteria.map((item) => [normalizedLabel(item), item]));
   const displayValues = (brief.values ?? []).map((item) => {
@@ -178,7 +181,7 @@ export default async function SavedDecisionPage({ params, searchParams }: {
           <div className="mt-4 grid gap-2 text-sm">
             <div className="surface-panel p-3">
               <p className="font-medium text-brand-text">Decision</p>
-              <p className="mt-1 text-brand-muted">{String(brief.goal?.value ?? decision.prompt)}</p>
+              <p className="mt-1 text-brand-muted">{String(brief.goal?.value ?? decision.title)}</p>
               <p className="mt-1 text-[11px] capitalize text-brand-muted">
                 {brief.goal?.source ?? "explicit"} · {brief.goal?.confidence ?? "high"} confidence
               </p>
@@ -291,19 +294,18 @@ export default async function SavedDecisionPage({ params, searchParams }: {
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.18em] text-brand-muted">Recommendation</p>
-              <h2 className="mt-1 text-2xl font-semibold text-brand-text">{shortOptionLabel(recommendation.selected_option_title ?? "Recommendation")}</h2>
+              <h2 className="mt-1 text-2xl font-semibold text-brand-text">{recommendationTitle}</h2>
+              {recommendation.concrete_example && recommendation.selected_option_title && (
+                <p className="mt-1 text-sm text-brand-muted">
+                  <strong className="font-medium text-brand-text">Category:</strong> {shortOptionLabel(recommendation.selected_option_title)}
+                </p>
+              )}
             </div>
             <span className="rounded-lg bg-brand-soft px-3 py-1.5 text-xs font-medium capitalize text-brand-muted">
               {recommendationStrength(recommendation.robustness)}
             </span>
           </div>
           <p className="mt-3 leading-7 text-brand-muted">{displayText(recommendation.summary)}</p>
-          {recommendation.concrete_example && (
-            <p className="mt-2 text-sm leading-6 text-brand-muted">
-              <strong className="text-brand-text">Example:</strong> {displayText(recommendation.concrete_example)}
-            </p>
-          )}
-
           {decision.status !== "completed" && (
             <form action={completeDecision.bind(null, decision.id)} className="mt-4">
               <button className="rounded-lg bg-brand-primary px-4 py-2.5 text-sm font-medium text-white">

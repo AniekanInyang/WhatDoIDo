@@ -10,6 +10,7 @@ from groq import AsyncGroq, BadRequestError, RateLimitError
 from pydantic import BaseModel, Field
 
 from app.core.config import Settings
+from app.core.text import normalize_decision_wording
 from app.graph.state import (
     ActionPlan,
     DecisionRisk,
@@ -112,7 +113,7 @@ class SensitivityDraft(BaseModel):
 class RecommendationDraft(BaseModel):
     selected_option_id: str
     summary: str
-    concrete_example: str | None = None
+    concrete_example: str = Field(min_length=3)
     rationale: list[str] = Field(default_factory=list)
     option_assessments: list[RecommendationAssessmentDraft] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
@@ -388,6 +389,15 @@ def _sanitize_recommendation(result: RecommendationResult, option_by_id: dict[st
 
     result.summary = clean(result.summary) or ""
     result.concrete_example = clean(result.concrete_example)
+    if result.concrete_example:
+        # The presentation layer promotes this value to the recommendation
+        # headline, so keep only the actionable noun/action phrase.
+        result.concrete_example = re.sub(
+            r"^(?:for example\s*[:,.-]?\s*|for instance\s*[:,.-]?\s*|try\s+|i recommend\s+)",
+            "",
+            result.concrete_example,
+            flags=re.IGNORECASE,
+        ).strip().rstrip(".") or None
     result.rationale = _unique_text([clean(item) or "" for item in result.rationale])[:3]
     result.assumptions = _unique_text([clean(item) or "" for item in result.assumptions])[:4]
     result.unresolved_uncertainties = _unique_text(
@@ -510,6 +520,15 @@ def _record_completion(brief: dict, completion, cache_key: str, content: str, mo
         del cache[next(iter(cache))]
 
 
+def _safe_completion_token_limit(model: str, requested: int) -> int:
+    """Keep requests below known provider/model output-token ceilings."""
+    if model.startswith("qwen/"):
+        # Groq currently enforces a 1,000 OTPM ceiling for these on-demand
+        # models. Leave headroom so the request is accepted before generation.
+        return min(requested, 900)
+    return requested
+
+
 async def _complete_structured(
     client: AsyncGroq,
     models: list[str | None],
@@ -526,6 +545,10 @@ async def _complete_structured(
     repair_used = False
     for model in dict.fromkeys(model for model in models if model):
         request_kwargs = dict(kwargs)
+        requested_tokens = int(request_kwargs.get("max_completion_tokens", 500))
+        request_kwargs["max_completion_tokens"] = _safe_completion_token_limit(
+            model, requested_tokens
+        )
         request_kwargs["response_format"] = _strict_response_format(schema_name, response_model)
         if model.startswith("openai/gpt-oss-"):
             request_kwargs.setdefault("reasoning_effort", "low")
@@ -801,6 +824,10 @@ EXTRACTION_PROMPT = """Extract only facts stated or directly implied by the newe
 message into the requested compact JSON object. Treat a short reply as decision
 input when pending_question shows that it answers the coach. Use plain strings for
 facts and string arrays for fact lists. Do not copy unchanged facts from current_state.
+When setting goal, silently normalize obvious spelling, transposed-letter, and
+accidental word-boundary errors while preserving the user's meaning. The goal is
+clean display text, not a verbatim transcript. Do not apply that rewriting to
+options, preferences, names, brands, or other user-provided facts.
 Set is_decision_input=false for greetings, unrelated requests, incoherent text,
 or content that does not describe or advance a decision. Set direction_change
 only when the user explicitly replaces the central decision, not when they add
@@ -865,7 +892,7 @@ def _extraction_patch_from_draft(draft: ExtractionDraft, message_id: str) -> Dec
         "direction_change": draft.direction_change,
         "direction_change_summary": draft.direction_change_summary,
         "decision_stakes": stakes,
-        "goal": fact(draft.goal),
+        "goal": fact(normalize_decision_wording(draft.goal) if draft.goal else None),
         "domain": fact(draft.domain),
         "deadline": fact(draft.deadline),
         "values": facts(draft.values),
@@ -964,7 +991,7 @@ async def extract_decision_patch(
     elif not current_brief.get("goal"):
         fallback = DecisionStatePatch(
             goal={
-                "value": message.strip(),
+                "value": normalize_decision_wording(message),
                 "source": "explicit",
                 "confidence": "high",
                 "evidence_message_ids": [message_id],
@@ -1050,8 +1077,9 @@ that could directly answer the central decision. Do not ask for a format, channe
 feature, audience, style, or general category unless those are themselves the
 alternatives being compared.
 Every suggested option must be a concrete, actionable endpoint—not a broad
-direction or category. For example, “personalized keepsake” is a direction,
-whereas a custom photo book built from shared memories is actionable. If a
+direction, dress code, format, or category. Its title must name what the person
+could actually choose, buy, wear, do, or try and include enough defining detail
+that a person would understand it without asking what the label means. If a
 selected direction appears in the preference signals, generate concrete candidates
 inside that direction rather than switching to another direction.
 Never introduce an alternative only in the prose. If you offer concrete
@@ -1090,17 +1118,70 @@ def _normalize_question_payload(payload: dict) -> dict:
 
 
 def _question_advances_target(draft: QuestionDraft) -> bool:
-    """Reject fluent questions that do not gather the selected information."""
+    """Reject questions that clearly gather a different kind of information.
+
+    Do not require target-specific keywords here. Natural questions can elicit
+    alternatives without saying ``option`` or ``choice`` (for example, "What
+    would you feel best wearing to dinner?"). Keyword requirements caused valid
+    provider output to be rejected by both models and surfaced as a false 503.
+    """
     question = " ".join(draft.question.lower().split())
     if draft.target_field in {"options", "concrete_options"}:
         if draft.suggested_options:
             return all(option.specificity == "actionable" for option in draft.suggested_options)
-        return bool(re.search(r"\b(option|options|choice|choices|alternative|alternatives|idea|ideas|considering)\b", question))
+        asks_for_another_target = any(
+            re.search(pattern, question)
+            for pattern in (
+                r"\bwhy\b|\breason\b",
+                r"\bmost important\b|\bmatters most\b|\bhow important\b|\bimportance\b|\brank(?:ing)?\b",
+                r"\bhard limit\b|\bnon-negotiable\b|\bconstraint\b|\bbudget limit\b",
+                r"\bwhat (?:are you|is) worried about\b|\bwhat could go wrong\b",
+            )
+        )
+        return not asks_for_another_target
     if draft.target_field == "goal":
-        if re.search(r"\b(why|reason)\b", question):
-            return False
-        return bool(re.search(r"\b(decide|decision|choose|choice|help with|trying to)\b", question))
+        return not bool(re.search(r"\b(why|reason)\b", question))
     return True
+
+
+def _question_validation_errors(
+    draft: QuestionDraft,
+    forbidden: list[str | None],
+) -> list[str]:
+    """Return actionable reasons a generated question is unsafe or off-target."""
+    question = " ".join(draft.question.lower().split())
+    previous = {" ".join(str(item).lower().split()) for item in forbidden if item}
+    errors: list[str] = []
+    if question in previous:
+        errors.append("it repeats a previous question")
+    if "?" not in draft.question:
+        errors.append("it is not phrased as a question")
+    if draft.target_field == "uncertainties" and any(
+        phrase in question for phrase in ("hard limit", "non-negotiable", "infeasible")
+    ):
+        errors.append("it asks for a constraint instead of an uncertainty")
+    if draft.target_field == "constraints" and any(
+        phrase in question for phrase in ("how important", "rank the importance")
+    ):
+        errors.append("it asks for criterion importance instead of a constraint")
+
+    normalized_question = re.sub(r"[^a-z0-9]+", " ", question).strip()
+    missing_titles = [
+        option.title for option in draft.suggested_options
+        if re.sub(r"[^a-z0-9]+", " ", option.title.lower()).strip()
+        not in normalized_question
+    ]
+    if missing_titles:
+        errors.append("it does not mention every persisted suggested option")
+    if (
+        draft.target_field in {"options", "concrete_options"}
+        and " or " in question
+        and not draft.suggested_options
+    ):
+        errors.append("it introduces alternatives that were not persisted")
+    if not _question_advances_target(draft):
+        errors.append(f"it asks for information outside the {draft.target_field} target")
+    return errors
 
 
 async def generate_clarification_question(
@@ -1146,29 +1227,12 @@ async def generate_clarification_question(
                 "specificity": option.specificity,
             } for option in provider.suggested_options],
         )
-        previous = {" ".join(str(question).lower().split()) for question in forbidden if question}
-        normalized_question = " ".join(draft.question.lower().split())
-        semantic_mismatch = (
-            draft.target_field == "uncertainties"
-            and any(phrase in normalized_question for phrase in ("hard limit", "non-negotiable", "infeasible"))
-        ) or (
-            draft.target_field == "constraints"
-            and any(phrase in normalized_question for phrase in ("how important", "rank the importance"))
-        )
-        suggested_titles = {" ".join(option.title.lower().split()) for option in draft.suggested_options}
-        suggestion_mismatch = bool(draft.suggested_options) and any(
-            title not in normalized_question for title in suggested_titles
-        )
-        untracked_choice = (
-            draft.target_field == "options" and " or " in normalized_question
-            and not draft.suggested_options
-        )
-        if (
-            normalized_question in previous or "?" not in draft.question
-            or semantic_mismatch or suggestion_mismatch or untracked_choice
-            or not _question_advances_target(draft)
-        ):
-            raise ValueError("The generated question did not satisfy the selected semantic target")
+        validation_errors = _question_validation_errors(draft, forbidden)
+        if validation_errors:
+            raise ValueError(
+                f"Question validation failed for target={draft.target_field}: "
+                + "; ".join(validation_errors)
+            )
         return draft
 
     if cached:
@@ -1292,13 +1356,14 @@ sensitivity_analysis (factor, current_assumption, change_that_could_flip_result,
 likely_winner_option_id or null, explanation), robustness (low/moderate/high),
 and caveat. Sensitivity analysis must explain concrete plausible changes that
 could change the winner. All fields described as lists must be JSON arrays.
-Set concrete_example to one concise, practical example when the selected option
-is a broad category that would otherwise leave the user wondering what to buy,
-do, choose, or try. For example, a category such as "gourmet dessert" needs a
-specific illustration, while an already-specific action does not. Frame it as
-an illustration, not a claim about availability or objective superiority. Set
-concrete_example to null when the selected option is already concrete. Do not
-repeat the selected option title or summary in the example.
+Always set concrete_example to one concise, practical, self-contained action or
+choice. This value becomes the user-facing recommendation headline. When the
+selected option is a broad category, instantiate it as a concrete item, outfit,
+action, or plan with enough defining detail to be useful. Do not merely repeat or
+paraphrase the category label. When the selected option is already concrete, use
+a concise actionable rendering of it. Return a direct noun or action phrase
+without prefixes such as "For example", "Try", or "I recommend". Do not claim
+availability or objective superiority. Do not repeat concrete_example in summary.
 The only allowed option-assessment fit values are weak, mixed, or strong.
 Acknowledge insufficient evidence through assumptions, uncertainties, caveat,
 and lower robustness. If readiness.enough_to_recommend is false or blockers are
@@ -1319,7 +1384,11 @@ refer to them as "the user". The summary must explain the choice without
 restating "X is recommended" because the presentation layer already names it.
 Use at most three distinct rationale bullets. Name a useful alternate when at
 least two options exist, and say briefly when it would fit better. Do not repeat
-the same limitation across caveat, assumptions, uncertainties, checks, or risks."""
+the same limitation across caveat, assumptions, uncertainties, checks, or risks.
+Keep the complete response small: at most two strengths and two trade-offs per
+option; one constraint conflict per option; two assumptions; two unresolved
+uncertainties; two risks; two checks; and two sensitivity factors. Each item and
+the summary must be a single concise sentence."""
 
 
 def _as_string_list(value) -> list[str]:
@@ -1451,11 +1520,15 @@ async def generate_grounded_recommendation(
     key = _cache_key("recommendation", payload)
     cached = _cached_content(brief, key, settings)
     if cached:
-        draft = _validate_recommendation_selection(
-            RecommendationDraft.model_validate_json(cached), confirmed_selection
-        )
-        result = _recommendation_from_draft(draft)
-    else:
+        try:
+            draft = _validate_recommendation_selection(
+                RecommendationDraft.model_validate_json(cached), confirmed_selection
+            )
+            result = _recommendation_from_draft(draft)
+        except Exception:
+            logger.warning("Ignoring cached recommendation that no longer satisfies the output contract")
+            cached = None
+    if not cached:
         _check_budget(brief, payload, settings.recommendation_max_tokens, settings)
         client = AsyncGroq(
             api_key=settings.groq_api_key.get_secret_value(), timeout=30.0, max_retries=0
