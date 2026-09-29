@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     decision_llm_token_budget: int = 20_000
     decision_revision_turn_budget: int = 2
     decision_max_clarification_turns: int = 8
+    decision_assistive_option_suggestions: bool = True
     extraction_max_tokens: int = 500
     question_max_tokens: int = 300
     recommendation_max_tokens: int = 900

@@ -245,6 +245,31 @@ def _rejects_current_suggested_options(message: str) -> bool:
     return any(phrase in normalized for phrase in rejection_phrases)
 
 
+def _cannot_provide_specific_options(message: str) -> bool:
+    normalized = _normalized(message)
+    patterns = (
+        "i dont have", "i don t have", "i do not have", "dont have", "don t have", "do not have",
+        "no options", "no specific options", "no specific option",
+        "i have no", "not sure", "idk", "i dont know", "i do not know",
+        "you decide", "you choose", "whatever",
+    )
+    if any(pattern in normalized for pattern in patterns):
+        return True
+    return normalized in {"no", "nope", "none"}
+
+
+def _has_actionable_preference_context(brief: DecisionBrief) -> bool:
+    """Whether there is enough user context to infer provisional options.
+
+    This prevents repeated option prompts when the user already supplied mood,
+    values, or contextual preferences that can seed concrete alternatives.
+    """
+    has_values = bool(_active(brief.values))
+    has_preferences = bool(_active(brief.preference_signals))
+    has_constraints = bool(_active(brief.constraints))
+    return has_values or has_preferences or has_constraints
+
+
 def _snapshot_for_supersession(brief: DecisionBrief) -> dict[str, Any]:
     return {
         "revision": brief.revision,
@@ -465,7 +490,43 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
             unresolved = next((item for item in brief.contradictions if item.status == "unresolved"), None)
             assumption = next((item for item in brief.assumptions if item.status == "candidate" and item.importance == "high"), None)
             active_option_count = len(_actionable_options(state.get("existing_options", [])))
-            if _requests_recommendation(state["user_message"]):
+            assistive_mode = bool(settings.decision_assistive_option_suggestions)
+            if (
+                assistive_mode
+                and settings.groq_api_key
+                and brief.next_action is not None
+                and brief.next_action.category == "options"
+                and active_option_count < 2
+                and _cannot_provide_specific_options(state["user_message"])
+            ):
+                action = ActionPlan(
+                    action="recommend",
+                    category="recommendation",
+                    rationale=(
+                        "The user cannot provide specific alternatives. Infer provisional concrete options "
+                        "from the saved context and proceed with a clearly caveated recommendation."
+                    ),
+                    utility=1,
+                )
+            elif (
+                assistive_mode
+                and settings.groq_api_key
+                and brief.next_action is not None
+                and brief.next_action.category == "options"
+                and active_option_count < 2
+                and brief.next_action.attempt >= 2
+                and _has_actionable_preference_context(brief)
+            ):
+                action = ActionPlan(
+                    action="recommend",
+                    category="recommendation",
+                    rationale=(
+                        "Repeated option clarification did not produce concrete alternatives. "
+                        "Infer provisional actionable options from existing context and proceed."
+                    ),
+                    utility=1,
+                )
+            elif _requests_recommendation(state["user_message"]):
                 action = ActionPlan(
                     action="recommend", category="recommendation",
                     rationale=(

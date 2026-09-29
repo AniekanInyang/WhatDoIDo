@@ -1518,6 +1518,77 @@ an existing option. Return JSON only with an options array. Every option must
 include a concise title, an optional description, and specificity="actionable"."""
 
 
+def _fallback_immediate_options(
+    brief: dict,
+    options: list[dict],
+) -> list[OptionObservation]:
+    """Deterministic fallback for assistive mode when provider calls fail.
+
+    Uses lightweight domain cues so users who do not know specific options can
+    still receive concrete alternatives instead of another dead-end prompt.
+    """
+    existing_titles = {
+        " ".join(str(option.get("title", "")).lower().split())
+        for option in options if option.get("status") != "rejected"
+    }
+    goal_text = ""
+    goal = brief.get("goal") or {}
+    if isinstance(goal, dict):
+        goal_text = str(goal.get("value") or "").lower()
+    preference_text = " ".join(
+        str(item.get("value") or "")
+        for item in brief.get("preference_signals", [])
+        if isinstance(item, dict) and item.get("status") != "rejected"
+    ).lower()
+    value_text = " ".join(
+        str(item.get("value") or "")
+        for item in brief.get("values", [])
+        if isinstance(item, dict) and item.get("status") != "rejected"
+    ).lower()
+    context = f"{goal_text} {preference_text} {value_text}"
+
+    if "music" in context or "song" in context or "audio" in context:
+        if any(term in context for term in ("romantic", "calm", "soft", "gentle")):
+            candidates = [
+                ("Romantic piano instrumental", "Soft piano with warm ambient strings"),
+                ("Calm lo-fi groove", "Low-tempo lo-fi beat with mellow chords"),
+            ]
+        elif any(term in context for term in ("energetic", "hype", "fast", "upbeat")):
+            candidates = [
+                ("Upbeat pop instrumental", "Bright tempo with rhythmic hooks"),
+                ("Energetic electronic beat", "Driving percussion and bold synth layers"),
+            ]
+        else:
+            candidates = [
+                ("Cinematic ambient track", "Atmospheric score for emotional storytelling"),
+                ("Minimal acoustic instrumental", "Clean guitar-led bed with light rhythm"),
+            ]
+    elif any(term in context for term in ("breakfast", "lunch", "dinner", "meal", "eat", "cook")):
+        candidates = [
+            ("Chicken and veggie grain bowl", "Balanced bowl with lean protein and vegetables"),
+            ("Salmon salad with avocado", "Light salad with healthy fats and protein"),
+        ]
+    else:
+        candidates = [
+            ("Conservative practical choice", "Safer option prioritizing reliability and low downside"),
+            ("Higher-upside experimental choice", "Bolder option prioritizing potential upside"),
+        ]
+
+    inferred: list[OptionObservation] = []
+    for title, description in candidates:
+        normalized = " ".join(title.lower().split())
+        if normalized in existing_titles:
+            continue
+        inferred.append(OptionObservation(
+            title=title,
+            description=description,
+            source="ai_generated",
+            kind="alternative",
+            specificity="actionable",
+        ))
+    return inferred[:3]
+
+
 async def generate_immediate_options(
     brief: dict,
     options: list[dict],
@@ -1525,7 +1596,7 @@ async def generate_immediate_options(
 ) -> list[OptionObservation]:
     """Infer provisional choices so an explicit recommend-now request can proceed."""
     if not settings.groq_api_key:
-        raise DecisionLLMGenerationError("Option inference requires an AI provider")
+        return _fallback_immediate_options(brief, options)
     payload = {
         "decision_brief": _compact_brief(brief),
         "existing_options": _compact_options(options),
@@ -1563,26 +1634,29 @@ async def generate_immediate_options(
         except Exception:
             logger.warning("Ignoring invalid cached immediate option set")
 
-    _check_budget(brief, payload, settings.question_max_tokens, settings)
-    client = AsyncGroq(
-        api_key=settings.groq_api_key.get_secret_value(), timeout=20.0, max_retries=0
-    )
-    await asyncio.sleep(settings.llm_stage_delay_seconds)
-    completion, model, inferred, content = await _complete_structured(
-        client, [settings.groq_light_model, settings.groq_light_fallback_model],
-        stage="immediate_options",
-        schema_name="immediate_decision_options",
-        response_model=ImmediateOptionSetDraft,
-        parse=parse_options,
-        messages=[
-            {"role": "system", "content": IMMEDIATE_OPTIONS_PROMPT},
-            {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
-        ],
-        temperature=0.25,
-        max_completion_tokens=settings.question_max_tokens,
-    )
-    _record_completion(brief, completion, key, content, model, settings)
-    return inferred
+    try:
+        _check_budget(brief, payload, settings.question_max_tokens, settings)
+        client = AsyncGroq(
+            api_key=settings.groq_api_key.get_secret_value(), timeout=20.0, max_retries=0
+        )
+        await asyncio.sleep(settings.llm_stage_delay_seconds)
+        completion, model, inferred, content = await _complete_structured(
+            client, [settings.groq_light_model, settings.groq_light_fallback_model],
+            stage="immediate_options",
+            schema_name="immediate_decision_options",
+            response_model=ImmediateOptionSetDraft,
+            parse=parse_options,
+            messages=[
+                {"role": "system", "content": IMMEDIATE_OPTIONS_PROMPT},
+                {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
+            ],
+            temperature=0.25,
+            max_completion_tokens=settings.question_max_tokens,
+        )
+        _record_completion(brief, completion, key, content, model, settings)
+        return inferred
+    except (DecisionLLMRateLimitError, DecisionLLMBudgetError, DecisionLLMGenerationError):
+        return _fallback_immediate_options(brief, options)
 
 
 RECOMMENDATION_PROMPT = """Produce a grounded recommendation from the supplied

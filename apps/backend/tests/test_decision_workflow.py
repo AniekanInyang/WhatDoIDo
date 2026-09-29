@@ -1128,6 +1128,61 @@ def test_which_should_i_requests_an_early_recommendation(monkeypatch) -> None:
     assert result["brief"]["phase"] == "recommended"
 
 
+def test_no_specific_options_reply_triggers_inferred_recommendation(monkeypatch) -> None:
+    async def fake_infer_options(brief, options, settings):
+        return [
+            OptionObservation(
+                title="Acoustic piano romance",
+                description="Soft piano-led track with warm strings",
+                source="ai_generated",
+                kind="alternative",
+                specificity="actionable",
+            ),
+            OptionObservation(
+                title="Lo-fi romantic groove",
+                description="Calm lo-fi beat with mellow guitar accents",
+                source="ai_generated",
+                kind="alternative",
+                specificity="actionable",
+            ),
+        ]
+
+    async def fake_recommendation(brief, options, settings):
+        return RecommendationResult(
+            selected_option_id="provisional-no-options-1",
+            selected_option_title="Acoustic piano romance",
+            summary="It best matches the romantic and calm mood while remaining broadly usable.",
+            rationale=["It directly fits the desired atmosphere."],
+        )
+
+    monkeypatch.setattr("app.graph.workflow.generate_immediate_options", fake_infer_options)
+    monkeypatch.setattr("app.graph.workflow.generate_grounded_recommendation", fake_recommendation)
+
+    graph = build_decision_graph(Settings(_env_file=None, groq_api_key="test-key"))
+    result = asyncio.run(graph.ainvoke({
+        "decision_id": "music", "user_id": "user-1",
+        "user_message": "I don't have 2 specific options", "message_id": "no-options",
+        "brief": {
+            "goal": {"value": "What kind of music should I use for my video?", "source": "explicit", "confidence": "high"},
+            "values": [{"value": "something romantic, calm", "source": "explicit", "confidence": "high"}],
+            "next_action": {
+                "action": "ask_clarification",
+                "category": "options",
+                "target_field": "options",
+                "question": "What two options do you want compared?",
+                "attempt": 2,
+                "rationale": "Need options",
+            },
+        },
+        "existing_options": [],
+        "profile": {},
+    }))
+
+    assert result["selected_action"]["action"] == "recommend"
+    assert result["brief"]["phase"] == "recommended"
+    assert "I recommend" in result["assistant_reply"]
+
+
 def test_failed_gap_extraction_does_not_repeat_identical_question() -> None:
     graph = build_decision_graph(Settings(_env_file=None, groq_api_key=None))
     result = asyncio.run(graph.ainvoke({
@@ -1192,6 +1247,118 @@ def test_rejecting_bad_suggested_options_does_not_force_recommendation_consent()
     }))
     assert result["selected_action"]["action"] == "ask_clarification"
     assert result["selected_action"]["category"] == "options"
+
+
+def test_cannot_provide_options_escalates_to_recommendation_when_ai_available(monkeypatch) -> None:
+    async def fake_immediate_options(brief, options, settings):
+        return [
+            OptionObservation(
+                title="Romantic piano instrumental",
+                description="Soft piano with minimal percussion",
+                source="ai_generated",
+                kind="alternative",
+                specificity="actionable",
+            ),
+            OptionObservation(
+                title="Calm acoustic guitar track",
+                description="Warm acoustic progression with light ambience",
+                source="ai_generated",
+                kind="alternative",
+                specificity="actionable",
+            ),
+        ]
+
+    async def fake_recommendation(brief, options, settings):
+        return RecommendationResult(
+            selected_option_id="provisional-message-music-1",
+            selected_option_title="Romantic piano instrumental",
+            summary="This best matches the requested romantic and calm mood.",
+            rationale=["It directly aligns with the mood requirement."],
+            robustness="low",
+            caveat="Provisional recommendation based on inferred alternatives.",
+        )
+
+    monkeypatch.setattr("app.graph.workflow.generate_immediate_options", fake_immediate_options)
+    monkeypatch.setattr("app.graph.workflow.generate_grounded_recommendation", fake_recommendation)
+
+    graph = build_decision_graph(Settings(_env_file=None, groq_api_key="test-key"))
+    result = asyncio.run(graph.ainvoke({
+        "decision_id": "music-decision",
+        "user_id": "user-1",
+        "user_message": "i don't have 2 specific options",
+        "message_id": "message-music",
+        "brief": {
+            "goal": {"value": "What kind of music should I use for my video?", "source": "explicit", "confidence": "high"},
+            "values": [{"value": "romantic, calm", "source": "explicit", "confidence": "high"}],
+            "next_action": {
+                "action": "ask_clarification",
+                "category": "options",
+                "target_field": "options",
+                "attempt": 2,
+                "question": "Which two specific music choices would you like to compare for your video?",
+                "rationale": "Need options",
+            },
+        },
+        "existing_options": [],
+        "profile": {},
+    }))
+    assert result["selected_action"]["action"] == "recommend"
+    assert result["brief"]["phase"] == "recommended"
+    assert "i recommend" in result["assistant_reply"].lower()
+
+
+def test_repeated_options_attempt_with_context_escalates_to_recommendation(monkeypatch) -> None:
+    async def fake_immediate_options(brief, options, settings):
+        return [
+            OptionObservation(
+                title="Romantic piano instrumental",
+                description="Soft piano with ambient strings",
+                source="ai_generated",
+                kind="alternative",
+                specificity="actionable",
+            ),
+            OptionObservation(
+                title="Calm lo-fi beat",
+                description="Gentle beat with warm pads",
+                source="ai_generated",
+                kind="alternative",
+                specificity="actionable",
+            ),
+        ]
+
+    async def fake_recommendation(brief, options, settings):
+        return RecommendationResult(
+            selected_option_id="provisional-message-loop-1",
+            selected_option_title="Romantic piano instrumental",
+            summary="This best matches the requested romantic calm mood.",
+            rationale=["It aligns most directly with the stated atmosphere."],
+        )
+
+    monkeypatch.setattr("app.graph.workflow.generate_immediate_options", fake_immediate_options)
+    monkeypatch.setattr("app.graph.workflow.generate_grounded_recommendation", fake_recommendation)
+
+    graph = build_decision_graph(Settings(_env_file=None, groq_api_key="test-key"))
+    result = asyncio.run(graph.ainvoke({
+        "decision_id": "music-loop", "user_id": "user-1",
+        "user_message": "no",
+        "message_id": "message-loop",
+        "brief": {
+            "goal": {"value": "What kind of music should I use for my video?", "source": "explicit", "confidence": "high"},
+            "values": [{"value": "romantic and calm", "source": "explicit", "confidence": "high"}],
+            "next_action": {
+                "action": "ask_clarification",
+                "category": "options",
+                "target_field": "options",
+                "attempt": 2,
+                "question": "Which two specific music choices would you like to compare?",
+                "rationale": "Need options",
+            },
+        },
+        "existing_options": [],
+        "profile": {},
+    }))
+    assert result["selected_action"]["action"] == "recommend"
+    assert result["brief"]["phase"] == "recommended"
 
 
 def test_short_reply_is_resolved_against_pending_semantic_target() -> None:
