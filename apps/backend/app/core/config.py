@@ -15,10 +15,13 @@ class Settings(BaseSettings):
     groq_light_fallback_model: str | None = "qwen/qwen3.8-27b"
     groq_recommendation_fallback_model: str | None = "openai/gpt-oss-20b"
     decision_llm_token_budget: int = 20_000
+    decision_revision_turn_budget: int = 2
     decision_max_clarification_turns: int = 8
+    decision_assistive_option_suggestions: bool = True
     extraction_max_tokens: int = 500
     question_max_tokens: int = 300
-    recommendation_max_tokens: int = 1_500
+    recommendation_max_tokens: int = 900
+    title_normalization_max_tokens: int = 120
     llm_stage_delay_seconds: float = 0.75
     frontend_origins: str = "http://localhost:3000"
 

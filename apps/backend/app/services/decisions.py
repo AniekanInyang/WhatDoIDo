@@ -30,12 +30,23 @@ from app.models.decision import (
     DecisionSummary,
     DecisionTitleUpdate,
 )
-from app.graph.state import ClarificationProfile, PolicyActionStats
+from app.graph.state import (
+    ClarificationProfile,
+    DecisionBrief,
+    Fact,
+    PolicyActionStats,
+    RecommendationVersion,
+    RevisionPolicy,
+)
 from app.graph.workflow import _same_option, build_decision_graph
 from app.llm.decision_assistant import (
     DecisionLLMBudgetError,
     DecisionLLMGenerationError,
     DecisionLLMRateLimitError,
+    classify_revision_feedback,
+    generate_revised_recommendation,
+    normalize_title_with_ai,
+    _short_option_label,
 )
 
 
@@ -149,10 +160,20 @@ class DecisionStore:
     ) -> None:
         """Run the first AI turn after the create response has been sent."""
         async with httpx.AsyncClient(timeout=10.0) as client:
-            await self._run_conversation_turn(client, decision_id, user_message, {}, [])
+            await self._run_conversation_turn(
+                client,
+                decision_id,
+                user_message,
+                {},
+                [],
+                update_title_from_goal=True,
+            )
 
     @staticmethod
     def _title_from_prompt(prompt: str) -> str:
+        # This is only a provisional display title while structured extraction
+        # runs. Semantic cleanup belongs to the model-produced goal, not to a
+        # hand-maintained spelling dictionary.
         normalized = " ".join(prompt.strip().split())
         if any(char.isalpha() for char in normalized) and normalized == normalized.upper():
             normalized = normalized.lower()
@@ -163,6 +184,70 @@ class DecisionStore:
         if len(words) > 8:
             title += "…"
         return title
+
+    @classmethod
+    def _title_from_brief(cls, brief: dict[str, Any]) -> str | None:
+        """Build the permanent title from the agent's normalized opening goal."""
+        goal = brief.get("goal")
+        if not isinstance(goal, dict):
+            return None
+        value = goal.get("value")
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return cls._title_from_prompt(value)
+
+    async def _finalize_title_from_brief(self, brief: dict[str, Any]) -> str | None:
+        fallback = self._title_from_brief(brief)
+        if not fallback:
+            return None
+        try:
+            normalized = await normalize_title_with_ai(fallback, self.settings)
+        except Exception:
+            normalized = None
+        return normalized or fallback
+
+    def _revision_policy(self, brief: dict[str, Any]) -> RevisionPolicy:
+        policy = RevisionPolicy.model_validate(brief.get("revision_policy") or {})
+        policy.revision_budget_total = max(1, int(self.settings.decision_revision_turn_budget))
+        if policy.revision_budget_used > policy.revision_budget_total:
+            policy.revision_budget_used = policy.revision_budget_total
+        return policy
+
+    @staticmethod
+    def _is_appreciation_message(message: str) -> bool:
+        normalized = " ".join(message.lower().split()).strip(" .!?")
+        gratitude_phrases = {
+            "thanks", "thank you", "thankyou", "thx", "ty", "appreciate it",
+            "got it thanks", "ok thanks", "okay thanks", "thank u",
+        }
+        return normalized in gratitude_phrases
+
+    @staticmethod
+    def _first_sentence(text: str, *, limit: int = 160) -> str:
+        cleaned = " ".join((text or "").split())
+        if not cleaned:
+            return ""
+        sentence = re.split(r"(?<=[.!?])\s+", cleaned, maxsplit=1)[0].strip()
+        sentence = re.sub(r"^[,:;\-\s]+", "", sentence)
+        if len(sentence) <= limit:
+            return sentence
+        trimmed = sentence[: limit - 1].rstrip(" ,;:")
+        return f"{trimmed}."
+
+    @classmethod
+    def _compose_upheld_reply(cls, selected_title: str, reasoning: str | None) -> str:
+        label = _short_option_label(selected_title or "the current option")
+        reason = cls._first_sentence(reasoning or "")
+        if reason:
+            return f"Got it. I still recommend {label}. {reason}"
+        return f"Got it. I still recommend {label}."
+
+    @classmethod
+    def _compose_revised_reply(cls, recommendation_label: str, summary: str | None) -> str:
+        summary_line = cls._first_sentence(summary or "")
+        if summary_line:
+            return f"Good catch. Updated recommendation: {recommendation_label}. {summary_line}"
+        return f"Good catch. Updated recommendation: {recommendation_label}."
 
     async def _insert_message(
         self,
@@ -202,13 +287,23 @@ class DecisionStore:
             user_message = await self._insert_message(
                 client, decision_id, "user", values.content, trusted_backend=False
             )
-            assistant_message = await self._run_conversation_turn(
-                client,
-                decision_id,
-                user_message,
-                decision.decision_brief,
-                [option.model_dump(mode="json") for option in decision.options],
-            )
+            if decision.recommendation:
+                assistant_message = await self._handle_recommendation_revision(
+                    client,
+                    decision_id,
+                    user_message,
+                    decision.decision_brief,
+                    [option.model_dump(mode="json") for option in decision.options],
+                    decision.recommendation,
+                )
+            else:
+                assistant_message = await self._run_conversation_turn(
+                    client,
+                    decision_id,
+                    user_message,
+                    decision.decision_brief,
+                    [option.model_dump(mode="json") for option in decision.options],
+                )
         return ConversationTurn(
             user_message=user_message,
             assistant_message=assistant_message,
@@ -283,6 +378,270 @@ class DecisionStore:
             prefer="resolution=merge-duplicates",
         )
 
+    @staticmethod
+    def _append_recommendation_version(
+        brief: DecisionBrief,
+        recommendation: dict[str, Any],
+        *,
+        source: str,
+        feedback: str | None = None,
+        change_note: str | None = None,
+    ) -> None:
+        brief.recommendation_versions.append(RecommendationVersion(
+            revision=brief.revision,
+            source=source,
+            summary=str(recommendation.get("summary") or "")[:400],
+            recommendation=recommendation,
+            feedback=feedback,
+            change_note=change_note,
+        ))
+        brief.recommendation_versions = brief.recommendation_versions[-20:]
+
+    async def _persist_pending_revision(
+        self,
+        client: httpx.AsyncClient,
+        decision_id: UUID,
+        user_message: DecisionMessage,
+        brief: DecisionBrief,
+        policy: RevisionPolicy,
+        reason: str,
+    ) -> DecisionMessage:
+        policy.pending_feedback = user_message.content
+        policy.pending_reason = reason
+        policy.pending_message_id = str(user_message.id)
+        policy.last_outcome = "saved_pending"
+        brief.phase = "revision_pending"
+        brief.revision_policy = policy
+        brief.revision += 1
+        await self._request(
+            client,
+            "PATCH",
+            "decisions",
+            params={"id": f"eq.{decision_id}", "user_id": f"eq.{self.user.id}"},
+            json={"decision_brief": brief.model_dump(mode="json"), "status": "evaluating"},
+            trusted_backend=True,
+        )
+        await self._record_state_event(
+            client,
+            decision_id,
+            "revision_saved_pending",
+            brief.revision,
+            {"message_id": str(user_message.id), "reason": reason},
+        )
+        return await self._insert_message(
+            client,
+            decision_id,
+            "assistant",
+            "I saved your correction. Retry workflow and I will apply it.",
+            trusted_backend=True,
+            structured_data={"workflow_error": "revision_pending", "retry_available": True},
+        )
+
+    async def _handle_recommendation_revision(
+        self,
+        client: httpx.AsyncClient,
+        decision_id: UUID,
+        user_message: DecisionMessage,
+        brief_data: dict[str, Any],
+        options: list[dict[str, Any]],
+        current_recommendation: dict[str, Any],
+    ) -> DecisionMessage:
+        if self._is_appreciation_message(user_message.content):
+            return await self._insert_message(
+                client,
+                decision_id,
+                "assistant",
+                "You’re welcome.",
+                trusted_backend=True,
+                structured_data={"action": {"action": "acknowledge_appreciation"}},
+            )
+
+        brief = DecisionBrief.model_validate(brief_data or {})
+        policy = self._revision_policy(brief.model_dump(mode="json"))
+        brief.phase = "revising"
+        brief.revision_policy = policy
+
+        if policy.revision_budget_used >= policy.revision_budget_total:
+            return await self._persist_pending_revision(
+                client,
+                decision_id,
+                user_message,
+                brief,
+                policy,
+                "revision_budget_exhausted",
+            )
+
+        active_options = [option for option in options if option.get("status") != "rejected"]
+        if len(active_options) < 2:
+            return await self._persist_pending_revision(
+                client,
+                decision_id,
+                user_message,
+                brief,
+                policy,
+                "insufficient_options",
+            )
+
+        try:
+            intent = await classify_revision_feedback(
+                brief.model_dump(mode="json"),
+                active_options,
+                user_message.content,
+                current_recommendation,
+                self.settings,
+            )
+        except (DecisionLLMRateLimitError, DecisionLLMBudgetError, DecisionLLMGenerationError):
+            return await self._persist_pending_revision(
+                client,
+                decision_id,
+                user_message,
+                brief,
+                policy,
+                "provider_unavailable",
+            )
+
+        policy.pending_feedback = None
+        policy.pending_reason = None
+        policy.pending_message_id = None
+
+        for feedback_item in intent.extracted_feedback:
+            brief.preference_signals.append(Fact(
+                value=f"Revision feedback: {feedback_item}",
+                source="explicit",
+                confidence="high",
+                status="confirmed",
+                evidence_message_ids=[str(user_message.id)],
+            ))
+
+        if intent.action == "uphold":
+            policy.revision_budget_used += 1
+            policy.last_outcome = "upheld"
+            brief.phase = "recommended"
+            brief.revision_policy = policy
+            brief.revision += 1
+            self._append_recommendation_version(
+                brief,
+                current_recommendation,
+                source="upheld",
+                feedback=user_message.content,
+                change_note="Recommendation upheld with rationale after feedback.",
+            )
+            assistant_reply = self._compose_upheld_reply(
+                str(current_recommendation.get("selected_option_title") or "the current option"),
+                intent.reasoning,
+            )
+            await self._request(
+                client,
+                "PATCH",
+                "decisions",
+                params={"id": f"eq.{decision_id}", "user_id": f"eq.{self.user.id}"},
+                json={
+                    "decision_brief": brief.model_dump(mode="json"),
+                    "status": "evaluating",
+                },
+                trusted_backend=True,
+            )
+            await self._record_state_event(
+                client,
+                decision_id,
+                "recommendation_upheld",
+                brief.revision,
+                {"message_id": str(user_message.id), "reason": intent.reasoning},
+            )
+            return await self._insert_message(
+                client,
+                decision_id,
+                "assistant",
+                assistant_reply,
+                trusted_backend=True,
+                structured_data={"action": {"action": "uphold_recommendation"}},
+            )
+
+        try:
+            revised = await generate_revised_recommendation(
+                brief.model_dump(mode="json"),
+                active_options,
+                current_recommendation,
+                user_message.content,
+                self.settings,
+            )
+        except (DecisionLLMRateLimitError, DecisionLLMBudgetError, DecisionLLMGenerationError):
+            return await self._persist_pending_revision(
+                client,
+                decision_id,
+                user_message,
+                brief,
+                policy,
+                "provider_unavailable",
+            )
+
+        if not revised:
+            return await self._persist_pending_revision(
+                client,
+                decision_id,
+                user_message,
+                brief,
+                policy,
+                "revision_generation_failed",
+            )
+
+        revised_payload = revised.model_dump(mode="json")
+        policy.revision_budget_used += 1
+        policy.last_outcome = "revised"
+        brief.phase = "recommended"
+        brief.revision_policy = policy
+        brief.revision += 1
+        self._append_recommendation_version(
+            brief,
+            current_recommendation,
+            source="revision",
+            feedback=user_message.content,
+            change_note="Superseded by revised recommendation.",
+        )
+        self._append_recommendation_version(
+            brief,
+            revised_payload,
+            source="revision",
+            feedback=user_message.content,
+            change_note="Revised recommendation applied from user feedback.",
+        )
+        recommendation_label = (
+            revised.concrete_example.strip() if revised.concrete_example
+            else _short_option_label(revised.selected_option_title)
+        )
+        assistant_reply = self._compose_revised_reply(recommendation_label, revised.summary)
+        await self._request(
+            client,
+            "PATCH",
+            "decisions",
+            params={"id": f"eq.{decision_id}", "user_id": f"eq.{self.user.id}"},
+            json={
+                "decision_brief": brief.model_dump(mode="json"),
+                "recommendation": revised_payload,
+                "status": "evaluating",
+            },
+            trusted_backend=True,
+        )
+        await self._record_state_event(
+            client,
+            decision_id,
+            "recommendation_revised",
+            brief.revision,
+            {
+                "message_id": str(user_message.id),
+                "feedback": user_message.content,
+                "change_note": "Revised recommendation applied.",
+            },
+        )
+        return await self._insert_message(
+            client,
+            decision_id,
+            "assistant",
+            assistant_reply,
+            trusted_backend=True,
+            structured_data={"action": {"action": "revise_recommendation"}},
+        )
+
     async def _run_conversation_turn(
         self,
         client: httpx.AsyncClient,
@@ -290,6 +649,8 @@ class DecisionStore:
         user_message: DecisionMessage,
         brief: dict[str, Any],
         options: list[dict[str, Any]],
+        *,
+        update_title_from_goal: bool = False,
     ) -> DecisionMessage:
         profile = await self._load_policy_profile(client)
         payload = {
@@ -361,7 +722,14 @@ class DecisionStore:
         await self._save_policy_profile(client, profile)
         try:
             return await self._persist_graph_result(
-                client, decision_id, user_message, options, profile, result
+                client,
+                decision_id,
+                user_message,
+                options,
+                profile,
+                result,
+                update_title_from_goal=update_title_from_goal,
+                remove_resolved_errors=True,
             )
         except Exception:
             return await self._insert_message(
@@ -441,6 +809,26 @@ class DecisionStore:
         decision = await self.get(decision_id)
         if decision.status == "completed":
             raise HTTPException(status_code=409, detail="This decision is already completed")
+        brief = DecisionBrief.model_validate(decision.decision_brief or {})
+        policy = self._revision_policy(brief.model_dump(mode="json"))
+        if brief.phase == "revision_pending" and policy.pending_feedback and decision.recommendation:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                synthetic_message = await self._insert_message(
+                    client,
+                    decision_id,
+                    "user",
+                    policy.pending_feedback,
+                    trusted_backend=True,
+                    structured_data={"retry_revision": True},
+                )
+                return await self._handle_recommendation_revision(
+                    client,
+                    decision_id,
+                    synthetic_message,
+                    decision.decision_brief,
+                    [option.model_dump(mode="json") for option in decision.options],
+                    decision.recommendation,
+                )
         user_message = next(
             (message for message in reversed(decision.messages) if message.role == "user"), None
         )
@@ -488,6 +876,8 @@ class DecisionStore:
                 [option.model_dump(mode="json") for option in decision.options],
                 profile,
                 result,
+                update_title_from_goal=True,
+                remove_resolved_errors=True,
             )
 
     async def _persist_graph_result(
@@ -498,6 +888,9 @@ class DecisionStore:
         options: list[dict[str, Any]],
         profile: ClarificationProfile,
         result: dict[str, Any],
+        *,
+        update_title_from_goal: bool = False,
+        remove_resolved_errors: bool = False,
     ) -> DecisionMessage:
 
         if result.get("direction_changed"):
@@ -512,6 +905,7 @@ class DecisionStore:
         persisted_option_ids = [] if result.get("direction_changed") else [
             str(option["id"]) for option in options if option.get("status") != "rejected"
         ]
+        option_id_map = {option_id: option_id for option_id in persisted_option_ids}
         for position, option in enumerate(result.get("new_options", []), start=len(options)):
             rows = await self._request(
                 client,
@@ -524,21 +918,47 @@ class DecisionStore:
                     "description": option.get("description"),
                     "position": position,
                     "source": option.get("source", "ai_extracted"),
-                    "metadata": {"evidence_message_id": str(user_message.id)},
+                    "metadata": {
+                        "evidence_message_id": str(user_message.id),
+                        "specificity": option.get("specificity", "actionable"),
+                    },
                 },
                 prefer_representation=True,
                 trusted_backend=True,
                 prefer="resolution=merge-duplicates",
             )
-            persisted_option_ids.append(str(rows[0]["id"]))
+            persisted_id = str(rows[0]["id"])
+            persisted_option_ids.append(persisted_id)
+            if option.get("id"):
+                option_id_map[str(option["id"])] = persisted_id
 
         updated_brief = result["brief"]
         updated_brief["option_ids"] = persisted_option_ids
         recommendation = result.get("recommendation")
+        if recommendation and option_id_map:
+            recommendation["selected_option_id"] = option_id_map.get(
+                str(recommendation.get("selected_option_id")),
+                str(recommendation.get("selected_option_id")),
+            )
+            for assessment in recommendation.get("option_assessments", []):
+                assessment["option_id"] = option_id_map.get(
+                    str(assessment.get("option_id")), str(assessment.get("option_id"))
+                )
+            for driver in recommendation.get("sensitivity_analysis", []):
+                winner = driver.get("likely_winner_option_id")
+                if winner is not None:
+                    driver["likely_winner_option_id"] = option_id_map.get(str(winner), str(winner))
+            for risk in recommendation.get("key_risks", []):
+                risk["option_ids"] = [
+                    option_id_map.get(str(option_id), str(option_id))
+                    for option_id in risk.get("option_ids", [])
+                ]
         phase_status = {
             "clarifying": "exploring",
             "evaluating": "evaluating",
             "recommended": "evaluating",
+            "revising": "evaluating",
+            "revision_pending": "evaluating",
             "completed": "completed",
         }.get(updated_brief["phase"], "exploring")
         await self._record_state_event(
@@ -554,6 +974,15 @@ class DecisionStore:
         )
 
         if recommendation:
+            typed_brief = DecisionBrief.model_validate(updated_brief)
+            if not typed_brief.recommendation_versions:
+                self._append_recommendation_version(
+                    typed_brief,
+                    recommendation,
+                    source="initial",
+                    change_note="Initial recommendation generated.",
+                )
+                updated_brief = typed_brief.model_dump(mode="json")
             severities = [risk.get("severity", "moderate") for risk in recommendation.get("key_risks", [])]
             risk_level = "high" if any(level in ("high", "critical") for level in severities) else "moderate" if severities else "unknown"
             existing_evaluations = await self._request(
@@ -605,18 +1034,26 @@ class DecisionStore:
                 trusted_backend=True,
                 prefer="resolution=ignore-duplicates",
             )
+        decision_update = {
+            "decision_brief": updated_brief,
+            "status": phase_status,
+            **({"recommendation": recommendation} if recommendation else {}),
+        }
+        if update_title_from_goal:
+            normalized_title = await self._finalize_title_from_brief(updated_brief)
+            if normalized_title:
+                decision_update["title"] = normalized_title
+
         await self._request(
             client,
             "PATCH",
             "decisions",
             params={"id": f"eq.{decision_id}", "user_id": f"eq.{self.user.id}"},
-            json={
-                "decision_brief": updated_brief,
-                "status": phase_status,
-                **({"recommendation": recommendation} if recommendation else {}),
-            },
+            json=decision_update,
             trusted_backend=True,
         )
+        if remove_resolved_errors:
+            await self._remove_resolved_workflow_errors(client, decision_id)
         return await self._insert_message(
             client,
             decision_id,
@@ -630,6 +1067,44 @@ class DecisionStore:
                 "workflow_error": result.get("recommendation_error"),
             },
         )
+
+    async def _remove_resolved_workflow_errors(
+        self,
+        client: httpx.AsyncClient,
+        decision_id: UUID,
+    ) -> None:
+        """Remove transient failure messages once a retry completes successfully."""
+        rows = await self._request(
+            client,
+            "GET",
+            "decision_messages",
+            params={
+                "decision_id": f"eq.{decision_id}",
+                "role": "eq.assistant",
+                "select": "id,structured_data",
+            },
+            trusted_backend=True,
+        )
+        retryable_errors = {
+            "rate_limited",
+            "question_unavailable",
+            "retryable",
+            "persistence",
+        }
+        for row in rows:
+            metadata = row.get("structured_data") or {}
+            if metadata.get("workflow_error") not in retryable_errors:
+                continue
+            await self._request(
+                client,
+                "DELETE",
+                "decision_messages",
+                params={
+                    "id": f"eq.{row['id']}",
+                    "decision_id": f"eq.{decision_id}",
+                },
+                trusted_backend=True,
+            )
 
     async def _record_state_event(
         self,

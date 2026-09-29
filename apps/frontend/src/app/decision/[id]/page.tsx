@@ -1,6 +1,7 @@
 import { PageHeader } from "@/components/page-header";
 import { ConversationComposer } from "@/components/conversation-composer";
 import { getDecision } from "@/lib/api/decisions";
+import { recommendationStrength, resolveOptionReferences, shortOptionLabel } from "@/lib/decision-display";
 import Link from "next/link";
 import { completeDecision, createOption, deleteOption, renameDecision, resolveContradiction, retryWorkflow, reviewBriefItem, reviewOption, sendMessage, updateOption } from "./actions";
 
@@ -95,10 +96,22 @@ export default async function SavedDecisionPage({ params, searchParams }: {
     risks?: BriefItem[];
     contradictions?: Array<{ id: string; topic: string; previous_value: string; new_value: string; status: string }>;
     readiness?: { score?: number };
+    recommendation_versions?: Array<{
+      revision?: number;
+      source?: "initial" | "revision" | "upheld";
+      summary?: string | null;
+      feedback?: string | null;
+      change_note?: string | null;
+      recommendation?: {
+        selected_option_title?: string;
+        concrete_example?: string | null;
+      };
+    }>;
   };
   const recommendation = decision.recommendation as null | {
     selected_option_title?: string;
     summary?: string;
+    concrete_example?: string | null;
     rationale?: string[];
     robustness?: "low" | "moderate" | "high";
     assumptions?: string[];
@@ -120,11 +133,29 @@ export default async function SavedDecisionPage({ params, searchParams }: {
     }>;
   };
   const latestAssistant = [...decision.messages].reverse().find((message) => message.role === "assistant");
+  const workflowError = String(latestAssistant?.structured_data?.workflow_error ?? "");
   const awaitingReply = decision.status !== "completed"
     && decision.messages.length > 0
     && decision.messages[decision.messages.length - 1]?.role === "user";
   const retryAvailable = latestAssistant?.structured_data?.retry_available === true && decision.status !== "completed";
+  const workflowBlocked = ["budget_exhausted", "revision_pending"].includes(workflowError);
+  const blockedMessage = workflowError === "revision_pending"
+    ? "Your feedback is saved. Tap Retry workflow to apply it."
+    : workflowError === "budget_exhausted"
+      ? "AI budget reached for this decision. Continue by editing options or start a new decision."
+      : "The workflow is paused. Retry workflow to continue.";
   const visibleOptions = decision.options.filter((option) => option.status !== "rejected");
+  const hasCompletedExchange = decision.messages.some((message) => message.role === "user")
+    && decision.messages.some((message) => message.role === "assistant")
+    && !awaitingReply;
+  const showRecommendNow = decision.status !== "completed"
+    && !recommendation
+    && !retryAvailable
+    && hasCompletedExchange;
+  const displayText = (value: string | null | undefined) => resolveOptionReferences(value, visibleOptions);
+  const recommendationTitle = recommendation?.concrete_example
+    ? displayText(recommendation.concrete_example)
+    : shortOptionLabel(recommendation?.selected_option_title ?? "Recommendation");
   const activeCriteria = (brief.criteria ?? []).filter((item) => item.status !== "rejected" && item.status !== "superseded");
   const criterionByLabel = new Map(activeCriteria.map((item) => [normalizedLabel(item), item]));
   const displayValues = (brief.values ?? []).map((item) => {
@@ -134,6 +165,7 @@ export default async function SavedDecisionPage({ params, searchParams }: {
   const valueLabels = new Set(displayValues.map(normalizedLabel));
   const remainingCriteria = activeCriteria.filter((item) => !valueLabels.has(normalizedLabel(item)));
   const displayStatus = decision.status === "completed" ? "completed" : recommendation ? "recommended" : decision.status;
+  const recommendationHistory = [...(brief.recommendation_versions ?? [])].reverse();
 
   return (
     <section className="mx-auto max-w-5xl">
@@ -151,8 +183,13 @@ export default async function SavedDecisionPage({ params, searchParams }: {
             action={sendAction}
             messages={decision.messages}
             awaitingReply={awaitingReply}
-            readOnly={decision.status === "completed" || retryAvailable}
-            readOnlyMessage={retryAvailable ? "The workflow is paused at a failed stage. Retry it before sending another message." : undefined}
+            showRecommendNow={showRecommendNow}
+            readOnly={decision.status === "completed" || retryAvailable || workflowBlocked}
+            readOnlyMessage={
+              retryAvailable || workflowBlocked
+                ? blockedMessage
+                : undefined
+            }
           />
           {retryAvailable && <form action={retryWorkflow.bind(null, decision.id)} className="mt-3"><button className="rounded-lg bg-brand-primary px-4 py-2 text-sm font-medium text-white">Retry workflow</button></form>}
         </article>
@@ -167,7 +204,7 @@ export default async function SavedDecisionPage({ params, searchParams }: {
           <div className="mt-4 grid gap-2 text-sm">
             <div className="surface-panel p-3">
               <p className="font-medium text-brand-text">Decision</p>
-              <p className="mt-1 text-brand-muted">{String(brief.goal?.value ?? decision.prompt)}</p>
+              <p className="mt-1 text-brand-muted">{String(brief.goal?.value ?? decision.title)}</p>
               <p className="mt-1 text-[11px] capitalize text-brand-muted">
                 {brief.goal?.source ?? "explicit"} · {brief.goal?.confidence ?? "high"} confidence
               </p>
@@ -280,14 +317,18 @@ export default async function SavedDecisionPage({ params, searchParams }: {
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.18em] text-brand-muted">Recommendation</p>
-              <h2 className="mt-1 text-2xl font-semibold text-brand-text">{recommendation.selected_option_title}</h2>
+              <h2 className="mt-1 text-2xl font-semibold text-brand-text">{recommendationTitle}</h2>
+              {recommendation.concrete_example && recommendation.selected_option_title && (
+                <p className="mt-1 text-sm text-brand-muted">
+                  <strong className="font-medium text-brand-text">Category:</strong> {shortOptionLabel(recommendation.selected_option_title)}
+                </p>
+              )}
             </div>
             <span className="rounded-lg bg-brand-soft px-3 py-1.5 text-xs font-medium capitalize text-brand-muted">
-              {recommendation.robustness ?? "unknown"} robustness
+              {recommendationStrength(recommendation.robustness)}
             </span>
           </div>
-          <p className="mt-3 leading-7 text-brand-muted">{recommendation.summary}</p>
-
+          <p className="mt-3 leading-7 text-brand-muted">{displayText(recommendation.summary)}</p>
           {decision.status !== "completed" && (
             <form action={completeDecision.bind(null, decision.id)} className="mt-4">
               <button className="rounded-lg bg-brand-primary px-4 py-2.5 text-sm font-medium text-white">
@@ -300,7 +341,7 @@ export default async function SavedDecisionPage({ params, searchParams }: {
             <section className="mt-5">
               <h3 className="font-semibold text-brand-text">Why this option</h3>
               <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-brand-muted">
-                {recommendation.rationale.map((reason) => <li key={reason}>{reason}</li>)}
+                {recommendation.rationale.map((reason) => <li key={reason}>{displayText(reason)}</li>)}
               </ul>
             </section>
           )}
@@ -315,9 +356,9 @@ export default async function SavedDecisionPage({ params, searchParams }: {
                       <p className="font-medium text-brand-text">{assessment.option_title}</p>
                       <span className="capitalize text-brand-muted">{assessment.fit} fit</span>
                     </div>
-                    {!!assessment.strengths.length && <p className="mt-2 text-brand-muted"><strong>Strengths:</strong> {assessment.strengths.join(" · ")}</p>}
-                    {!!assessment.tradeoffs.length && <p className="mt-1 text-brand-muted"><strong>Trade-offs:</strong> {assessment.tradeoffs.join(" · ")}</p>}
-                    {!!assessment.constraint_conflicts.length && <p className="mt-1 text-red-700"><strong>Conflicts:</strong> {assessment.constraint_conflicts.join(" · ")}</p>}
+                    {!!assessment.strengths.length && <p className="mt-2 text-brand-muted"><strong>Strengths:</strong> {assessment.strengths.map(displayText).join(" · ")}</p>}
+                    {!!assessment.tradeoffs.length && <p className="mt-1 text-brand-muted"><strong>Trade-offs:</strong> {assessment.tradeoffs.map(displayText).join(" · ")}</p>}
+                    {!!assessment.constraint_conflicts.length && <p className="mt-1 text-red-700"><strong>Conflicts:</strong> {assessment.constraint_conflicts.map(displayText).join(" · ")}</p>}
                   </div>
                 ))}
               </div>
@@ -330,10 +371,10 @@ export default async function SavedDecisionPage({ params, searchParams }: {
               <div className="mt-2 grid gap-2">
                 {recommendation.sensitivity_analysis.map((driver) => (
                   <div key={`${driver.factor}-${driver.change_that_could_flip_result}`} className="surface-panel p-3 text-sm">
-                    <p className="font-medium text-brand-text">{driver.factor}</p>
-                    <p className="mt-1 text-brand-muted">Currently: {driver.current_assumption}</p>
-                    <p className="mt-1 text-brand-muted">Could flip if: {driver.change_that_could_flip_result}</p>
-                    <p className="mt-1 text-brand-muted">{driver.explanation}</p>
+                    <p className="font-medium text-brand-text">{displayText(driver.factor)}</p>
+                    <p className="mt-1 text-brand-muted">Currently: {displayText(driver.current_assumption)}</p>
+                    <p className="mt-1 text-brand-muted">Could flip if: {displayText(driver.change_that_could_flip_result)}</p>
+                    <p className="mt-1 text-brand-muted">{displayText(driver.explanation)}</p>
                   </div>
                 ))}
               </div>
@@ -343,10 +384,47 @@ export default async function SavedDecisionPage({ params, searchParams }: {
           {(recommendation.caveat || !!recommendation.unresolved_uncertainties?.length || !!recommendation.assumptions?.length) && (
             <details className="mt-5 border-t border-brand-border pt-4">
               <summary className="cursor-pointer font-medium text-brand-text">Assumptions and uncertainties</summary>
-              {recommendation.caveat && <p className="mt-2 text-sm text-brand-muted">{recommendation.caveat}</p>}
-              {!!recommendation.assumptions?.length && <p className="mt-2 text-sm text-brand-muted"><strong>Assumptions:</strong> {recommendation.assumptions.join(" · ")}</p>}
-              {!!recommendation.unresolved_uncertainties?.length && <p className="mt-2 text-sm text-brand-muted"><strong>Still uncertain:</strong> {recommendation.unresolved_uncertainties.join(" · ")}</p>}
+              {recommendation.caveat && <p className="mt-2 text-sm text-brand-muted">{displayText(recommendation.caveat)}</p>}
+              {!!recommendation.assumptions?.length && <p className="mt-2 text-sm text-brand-muted"><strong>Assumptions:</strong> {recommendation.assumptions.map(displayText).join(" · ")}</p>}
+              {!!recommendation.unresolved_uncertainties?.length && <p className="mt-2 text-sm text-brand-muted"><strong>Still uncertain:</strong> {recommendation.unresolved_uncertainties.map(displayText).join(" · ")}</p>}
             </details>
+          )}
+
+          {!!recommendationHistory.length && (
+            <section className="mt-5 border-t border-brand-border pt-4">
+              <h3 className="font-semibold text-brand-text">Recommendation history</h3>
+              <div className="mt-3 grid gap-2">
+                {recommendationHistory.map((entry, index) => {
+                  const headline = entry.recommendation?.concrete_example
+                    ? displayText(entry.recommendation.concrete_example)
+                    : shortOptionLabel(entry.recommendation?.selected_option_title ?? "Recommendation");
+                  const sourceLabel = entry.source === "upheld"
+                    ? "Upheld"
+                    : entry.source === "revision"
+                      ? "Revision"
+                      : "Initial";
+                  return (
+                    <details key={`${entry.revision ?? index}-${sourceLabel}`} className="surface-panel p-3 text-sm">
+                      <summary className="cursor-pointer">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <p className="font-medium text-brand-text">{headline}</p>
+                          <span className="rounded-md bg-brand-soft px-2 py-1 text-[11px] font-medium text-brand-muted">
+                            {sourceLabel}{typeof entry.revision === "number" ? ` · r${entry.revision}` : ""}
+                          </span>
+                        </div>
+                      </summary>
+                      {entry.change_note && <p className="mt-2 text-brand-muted">{displayText(entry.change_note)}</p>}
+                      {entry.summary && <p className="mt-1 text-brand-muted">{displayText(entry.summary)}</p>}
+                      {entry.feedback && (
+                        <p className="mt-1 text-xs text-brand-muted">
+                          <strong className="font-medium text-brand-text">Feedback:</strong> {displayText(entry.feedback)}
+                        </p>
+                      )}
+                    </details>
+                  );
+                })}
+              </div>
+            </section>
           )}
         </article>
       )}

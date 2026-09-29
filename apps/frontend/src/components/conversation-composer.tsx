@@ -34,6 +34,7 @@ export function ConversationComposer({
   messages,
   showEmptyState = false,
   awaitingReply = false,
+  showRecommendNow = false,
   readOnly = false,
   readOnlyMessage = "This decision is complete. You can still rename it, but its conversation and options are read-only.",
 }: {
@@ -41,6 +42,7 @@ export function ConversationComposer({
   messages?: ConversationMessage[];
   showEmptyState?: boolean;
   awaitingReply?: boolean;
+  showRecommendNow?: boolean;
   readOnly?: boolean;
   readOnlyMessage?: string;
 }) {
@@ -84,18 +86,11 @@ export function ConversationComposer({
     }
   }
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function submitMessage(message: string, formData: FormData) {
     if (pending) return;
-
-    const form = event.currentTarget;
-    const formData = new FormData(form);
-    const message = String(formData.get("message") ?? "").trim();
-    if (!message) return;
 
     setOptimisticMessage(message);
     setPending(true);
-    form.reset();
 
     let navigating = false;
     try {
@@ -119,6 +114,26 @@ export function ConversationComposer({
         setPending(false);
       }
     }
+  }
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const form = event.currentTarget;
+    const formData = new FormData(form);
+    const message = String(formData.get("message") ?? "").trim();
+    if (!message) return;
+
+    form.reset();
+    await submitMessage(message, formData);
+  }
+
+  async function handleRecommendNow() {
+    if (pending || awaitingReply) return;
+    const message = "Give me a recommendation now";
+    const formData = new FormData();
+    formData.set("message", message);
+    await submitMessage(message, formData);
   }
 
   return (
@@ -164,19 +179,31 @@ export function ConversationComposer({
           </div>
         </div>
       )}
-      {!readOnly ? <form ref={formRef} onSubmit={handleSubmit} className="flex items-end gap-2">
-        <textarea
-          name="message"
-          className="field min-h-12 min-w-0 flex-1 resize-none p-3 text-sm"
-          placeholder="Type your message…"
-          rows={1}
-          required
-          maxLength={50000}
-          disabled={pending || awaitingReply}
-          onKeyDown={handleKeyDown}
-        />
-        <SendButton pending={pending || awaitingReply} />
-      </form> : (
+      {!readOnly ? <div>
+        <form ref={formRef} onSubmit={handleSubmit} className="flex items-end gap-2">
+          <textarea
+            name="message"
+            className="field min-h-12 min-w-0 flex-1 resize-none p-3 text-sm"
+            placeholder="Type your message…"
+            rows={1}
+            required
+            maxLength={50000}
+            disabled={pending || awaitingReply}
+            onKeyDown={handleKeyDown}
+          />
+          <SendButton pending={pending || awaitingReply} />
+        </form>
+        {showRecommendNow && (
+          <button
+            type="button"
+            onClick={handleRecommendNow}
+            disabled={pending || awaitingReply}
+            className="mt-2 rounded-lg border border-brand-border bg-white px-3 py-2 text-sm font-medium text-brand-primary hover:border-brand-accent hover:bg-brand-soft disabled:cursor-wait disabled:opacity-60"
+          >
+            Give recommendation now
+          </button>
+        )}
+      </div> : (
         <p className="rounded-lg bg-brand-soft px-3 py-2 text-xs text-brand-muted">
           {readOnlyMessage}
         </p>

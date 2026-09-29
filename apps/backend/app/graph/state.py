@@ -70,6 +70,7 @@ class OptionObservation(BaseModel):
     description: str | None = Field(default=None, max_length=2_000)
     source: Literal["user_provided", "ai_extracted", "ai_generated"] = "ai_extracted"
     kind: Literal["alternative", "context"] = "alternative"
+    specificity: Literal["direction", "actionable"] = "actionable"
 
 
 class DecisionStatePatch(BaseModel):
@@ -146,6 +147,7 @@ class RecommendationResult(BaseModel):
     selected_option_id: str
     selected_option_title: str
     summary: str
+    concrete_example: str | None = None
     rationale: list[str] = Field(min_length=1)
     option_assessments: list[OptionAssessment] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
@@ -168,10 +170,28 @@ class LLMUsage(BaseModel):
     exhausted: bool = False
 
 
+class RecommendationVersion(BaseModel):
+    revision: int = 0
+    source: Literal["initial", "revision", "upheld"] = "initial"
+    summary: str | None = None
+    recommendation: dict[str, Any] = Field(default_factory=dict)
+    feedback: str | None = None
+    change_note: str | None = None
+
+
+class RevisionPolicy(BaseModel):
+    revision_budget_total: int = 2
+    revision_budget_used: int = 0
+    pending_feedback: str | None = None
+    pending_reason: str | None = None
+    pending_message_id: str | None = None
+    last_outcome: Literal["none", "revised", "upheld", "saved_pending"] = "none"
+
+
 class DecisionBrief(BaseModel):
     schema_version: int = 2
     revision: int = 0
-    phase: Literal["intake", "clarifying", "evaluating", "recommended", "completed"] = "intake"
+    phase: Literal["intake", "clarifying", "evaluating", "recommended", "revising", "revision_pending", "completed"] = "intake"
     decision_stakes: DecisionStakes | None = None
     goal: Fact | None = None
     domain: Fact | None = None
@@ -194,6 +214,8 @@ class DecisionBrief(BaseModel):
     question_history: list[dict[str, Any]] = Field(default_factory=list)
     llm_usage: LLMUsage = Field(default_factory=LLMUsage)
     llm_cache: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    revision_policy: RevisionPolicy = Field(default_factory=RevisionPolicy)
+    recommendation_versions: list[RecommendationVersion] = Field(default_factory=list)
 
 
 class PolicyActionStats(BaseModel):

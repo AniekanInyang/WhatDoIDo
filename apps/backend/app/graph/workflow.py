@@ -21,9 +21,11 @@ from app.graph.state import (
     Readiness,
 )
 from app.llm.decision_assistant import (
+    _short_option_label,
     extract_decision_patch,
     generate_clarification_question,
     generate_grounded_recommendation,
+    generate_immediate_options,
 )
 
 
@@ -90,14 +92,94 @@ def _active(items: list[Any]) -> list[Any]:
     return [item for item in items if getattr(item, "status", "confirmed") not in ("rejected", "superseded")]
 
 
-def _gaps(brief: DecisionBrief, option_count: int) -> list[InformationGap]:
+def _option_specificity(option: dict[str, Any]) -> str:
+    return str(option.get("specificity") or (option.get("metadata") or {}).get("specificity") or "actionable")
+
+
+def _actionable_options(options: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        option for option in options
+        if option.get("status") != "rejected" and _option_specificity(option) == "actionable"
+    ]
+
+
+def _selected_direction(brief: DecisionBrief, options: list[dict[str, Any]]) -> str | None:
+    directions = {
+        _normalized(str(option.get("title", ""))): str(option.get("title", ""))
+        for option in options
+        if option.get("status") != "rejected" and _option_specificity(option) == "direction"
+    }
+    for signal in reversed(_active(brief.preference_signals)):
+        value = str(signal.value)
+        if not value.lower().startswith("selected option:"):
+            continue
+        selected = value.split(":", 1)[1].strip()
+        if _normalized(selected) in directions:
+            return directions[_normalized(selected)]
+    return None
+
+
+_WEATHER_PRIORITY_TERMS = {
+    "weather", "forecast", "temperature", "rain", "rainy", "snow", "snowy",
+    "wind", "windy", "heat", "hot", "cold", "humidity", "humid",
+}
+_WEATHER_DETAIL_TERMS = (_WEATHER_PRIORITY_TERMS - {"weather", "forecast"}) | {
+    "degree", "degrees", "fahrenheit", "celsius", "drizzle", "storm", "stormy",
+    "warm", "cool", "mild", "freezing", "sunny", "cloudy", "clear", "indoors",
+    "outdoors", "outside", "walk", "walking", "commute",
+}
+
+
+def _contains_any_term(value: str, terms: set[str]) -> bool:
+    words = set(_normalized(value).split())
+    return bool(words & terms)
+
+
+def _gaps(
+    brief: DecisionBrief,
+    option_count: int,
+    *,
+    selected_direction: str | None = None,
+) -> list[InformationGap]:
     gaps: list[InformationGap] = []
     if not brief.goal:
         gaps.append(InformationGap(key="goal", question_category="goal", impact=1, reason="The decision is not yet clear."))
+    if brief.goal and option_count < 2 and not _active(brief.values) and not _active(brief.preference_signals):
+        gaps.append(InformationGap(
+            key="decision_context", question_category="preferences", impact=.97,
+            reason=(
+                "Before generating choices, learn one decision-relevant fact about the person, "
+                "situation, needs, or preferences that would make the candidates meaningfully specific."
+            ),
+        ))
     if option_count < 2:
-        gaps.append(InformationGap(key="options", question_category="options", impact=.95, reason="A comparison needs at least two distinct choices."))
+        gaps.append(InformationGap(
+            key="concrete_options" if selected_direction else "options",
+            question_category="options",
+            impact=.95,
+            reason=(
+                f'The user selected “{selected_direction}” as a direction. Generate at least two concrete, '
+                "actionable candidates within that direction; do not switch directions or recommend the category itself."
+                if selected_direction else
+                "A comparison needs at least two concrete, actionable choices rather than broad categories."
+            ),
+        ))
     if not _active(brief.values):
         gaps.append(InformationGap(key="values", question_category="values", impact=.9, reason="The recommendation must reflect what matters to the user."))
+    active_context = [str(item.value) for item in [*_active(brief.values), *_active(brief.preference_signals)]]
+    active_context.extend(str(item.name) for item in _active(brief.criteria))
+    weather_matters = any(_contains_any_term(value, _WEATHER_PRIORITY_TERMS) for value in active_context)
+    known_conditions = [str(item.value) for item in [*_active(brief.constraints), *_active(brief.uncertainties)]]
+    if weather_matters and not any(_contains_any_term(value, _WEATHER_DETAIL_TERMS) for value in known_conditions):
+        gaps.append(InformationGap(
+            key="weather_context",
+            question_category="context",
+            impact=.94,
+            reason=(
+                "Weather matters to this decision, but the expected conditions and relevant exposure "
+                "have not been described. Ask for those decision-relevant details."
+            ),
+        ))
     if brief.decision_stakes == "low":
         return gaps
     if not _active(brief.criteria):
@@ -154,6 +236,40 @@ def _signals_repeated_question(message: str) -> bool:
     ))
 
 
+def _rejects_current_suggested_options(message: str) -> bool:
+    normalized = _normalized(message)
+    rejection_phrases = (
+        "these are not", "those are not", "wrong options", "different options",
+        "not lunch", "not breakfast", "not dinner", "not options",
+    )
+    return any(phrase in normalized for phrase in rejection_phrases)
+
+
+def _cannot_provide_specific_options(message: str) -> bool:
+    normalized = _normalized(message)
+    patterns = (
+        "i dont have", "i don t have", "i do not have", "dont have", "don t have", "do not have",
+        "no options", "no specific options", "no specific option",
+        "i have no", "not sure", "idk", "i dont know", "i do not know",
+        "you decide", "you choose", "whatever",
+    )
+    if any(pattern in normalized for pattern in patterns):
+        return True
+    return normalized in {"no", "nope", "none"}
+
+
+def _has_actionable_preference_context(brief: DecisionBrief) -> bool:
+    """Whether there is enough user context to infer provisional options.
+
+    This prevents repeated option prompts when the user already supplied mood,
+    values, or contextual preferences that can seed concrete alternatives.
+    """
+    has_values = bool(_active(brief.values))
+    has_preferences = bool(_active(brief.preference_signals))
+    has_constraints = bool(_active(brief.constraints))
+    return has_values or has_preferences or has_constraints
+
+
 def _snapshot_for_supersession(brief: DecisionBrief) -> dict[str, Any]:
     return {
         "revision": brief.revision,
@@ -169,7 +285,11 @@ def _snapshot_for_supersession(brief: DecisionBrief) -> dict[str, Any]:
 def build_decision_graph(settings: Settings, *, checkpointer=None):
     async def extract(state: GraphState) -> dict[str, Any]:
         patch = await extract_decision_patch(
-            state["user_message"], state["message_id"], state.get("brief", {}), settings
+            state["user_message"], state["message_id"], state.get("brief", {}), settings,
+            current_options=[
+                *state.get("existing_options", []),
+                *state.get("new_options", []),
+            ],
         )
         patch_data = patch.model_dump(mode="json")
         brief = DecisionBrief.model_validate(state.get("brief") or {})
@@ -317,8 +437,10 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
                 accepted.append(candidate)
                 all_titles.append(candidate["title"])
 
-        option_count = len(existing) + len(accepted)
-        gaps = _gaps(brief, option_count)
+        all_options = [*existing, *accepted]
+        selected_direction = _selected_direction(brief, all_options)
+        actionable_count = len(_actionable_options(all_options))
+        gaps = _gaps(brief, actionable_count, selected_direction=selected_direction)
         constraints_resolved = bool(_active(brief.constraints)) or "constraints" in brief.resolved_absences
         uncertainty_resolved = bool(_active(brief.uncertainties)) or "uncertainties" in brief.resolved_absences
         risk_resolved = (
@@ -327,10 +449,11 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
         )
         core_coverage = [
             brief.goal is not None,
-            option_count >= 2,
+            actionable_count >= 2,
             bool(_active(brief.values)),
-            bool(_active(brief.criteria)),
         ]
+        if brief.decision_stakes != "low":
+            core_coverage.append(bool(_active(brief.criteria)))
         if brief.decision_stakes in {None, "medium", "high"}:
             core_coverage.append(constraints_resolved)
         if brief.decision_stakes == "high":
@@ -366,14 +489,50 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
         else:
             unresolved = next((item for item in brief.contradictions if item.status == "unresolved"), None)
             assumption = next((item for item in brief.assumptions if item.status == "candidate" and item.importance == "high"), None)
-            active_option_count = len([
-                option for option in state.get("existing_options", [])
-                if option.get("status") != "rejected"
-            ])
-            if _requests_recommendation(state["user_message"]) and active_option_count >= 2:
+            active_option_count = len(_actionable_options(state.get("existing_options", [])))
+            assistive_mode = bool(settings.decision_assistive_option_suggestions)
+            if (
+                assistive_mode
+                and settings.groq_api_key
+                and brief.next_action is not None
+                and brief.next_action.category == "options"
+                and active_option_count < 2
+                and _cannot_provide_specific_options(state["user_message"])
+            ):
+                action = ActionPlan(
+                    action="recommend",
+                    category="recommendation",
+                    rationale=(
+                        "The user cannot provide specific alternatives. Infer provisional concrete options "
+                        "from the saved context and proceed with a clearly caveated recommendation."
+                    ),
+                    utility=1,
+                )
+            elif (
+                assistive_mode
+                and settings.groq_api_key
+                and brief.next_action is not None
+                and brief.next_action.category == "options"
+                and active_option_count < 2
+                and brief.next_action.attempt >= 2
+                and _has_actionable_preference_context(brief)
+            ):
+                action = ActionPlan(
+                    action="recommend",
+                    category="recommendation",
+                    rationale=(
+                        "Repeated option clarification did not produce concrete alternatives. "
+                        "Infer provisional actionable options from existing context and proceed."
+                    ),
+                    utility=1,
+                )
+            elif _requests_recommendation(state["user_message"]):
                 action = ActionPlan(
                     action="recommend", category="recommendation",
-                    rationale="The user explicitly requested an immediate recommendation; unresolved details must be disclosed as caveats.",
+                    rationale=(
+                        "The user explicitly requested an immediate recommendation. Infer provisional concrete "
+                        "options when necessary and disclose unresolved details as assumptions."
+                    ),
                     utility=1,
                 )
             elif _signals_repeated_question(state["user_message"]) and active_option_count >= 2:
@@ -405,6 +564,23 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
                     rationale="The user confirmed they want the offered evaluation; disclose any missing information as caveats.",
                     utility=1,
                 )
+            elif (
+                _rejects_current_suggested_options(state["user_message"])
+                and brief.next_action is not None
+                and brief.next_action.category == "options"
+            ):
+                action = ActionPlan(
+                    action="ask_clarification",
+                    category="options",
+                    target_field="options",
+                    expected_answer_type="list_of_options",
+                    rationale=(
+                        "The user rejected the current options as a mismatch. "
+                        "Collect two specific alternatives before evaluating."
+                    ),
+                    utility=1,
+                    attempt=(brief.next_action.attempt + 1),
+                )
             elif brief.readiness.enough_to_recommend:
                 action = ActionPlan(
                     action="evaluate", category="evaluation", target_field="recommendation_consent",
@@ -414,10 +590,8 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
             elif (
                 _clarification_count(brief)
                 >= _clarification_limit(brief, settings.decision_max_clarification_turns)
-                and len([
-                    option for option in state.get("existing_options", [])
-                    if option.get("status") != "rejected"
-                ]) >= 2
+                and active_option_count >= 2
+                and not _rejects_current_suggested_options(state["user_message"])
             ):
                 action = ActionPlan(
                     action="evaluate", category="evaluation", target_field="recommendation_consent",
@@ -445,6 +619,8 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
                     expected_answer_type={
                         "options": "list_of_options", "criteria": "factors_with_importance",
                         "risk": "risk_tolerance", "values": "short_priority",
+                        "preferences": "decision_relevant_context",
+                        "context": "conditions_and_exposure",
                     }.get(gap.question_category, "short_text") if not criteria_weighting else "importance_for_known_values",
                     rationale=(
                         f"{gap.reason} The previous attempt did not resolve this target; reframe it without repeating the question."
@@ -490,6 +666,7 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
                 if title_key and title_key not in existing_titles:
                     option.source = "ai_generated"
                     option.kind = "alternative"
+                    option.specificity = "actionable"
                     suggested_options.append(option.model_dump(mode="json"))
                     existing_titles.add(title_key)
         history = [*brief.question_history, {
@@ -511,24 +688,53 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
 
     async def evaluate_options(state: GraphState) -> dict[str, Any]:
         """Decision engine: compare persisted options against the typed brief."""
-        options = [option for option in state.get("existing_options", []) if option.get("status") != "rejected"]
+        options = _actionable_options(state.get("existing_options", []))
         result = await generate_grounded_recommendation(state["brief"], options, settings)
         if not result:
             raise RecommendationGenerationError("The provider returned no valid grounded recommendation")
         return {"recommendation": result.model_dump(mode="json"), "brief": state["brief"]}
 
+    async def infer_options_for_immediate_recommendation(state: GraphState) -> dict[str, Any]:
+        """Create provisional concrete choices instead of forcing more questions."""
+        brief = DecisionBrief.model_validate(state["brief"])
+        combined = [
+            *state.get("existing_options", []),
+            *state.get("new_options", []),
+        ]
+        brief_payload = brief.model_dump(mode="json")
+        inferred = await generate_immediate_options(brief_payload, combined, settings)
+        brief.llm_usage = brief.llm_usage.model_validate(brief_payload.get("llm_usage") or {})
+        brief.llm_cache = brief_payload.get("llm_cache") or {}
+        generated: list[dict[str, Any]] = []
+        for index, option in enumerate(inferred, start=1):
+            item = option.model_dump(mode="json")
+            item.update({
+                "id": f"provisional-{state.get('message_id', 'option')}-{index}",
+                "status": "candidate",
+            })
+            generated.append(item)
+        if len(_actionable_options([*combined, *generated])) < 2:
+            raise RecommendationGenerationError("Could not infer enough concrete options to compare")
+        brief.assumptions = _merge_named(brief.assumptions, [Assumption(
+            statement="The alternatives used for this immediate recommendation were inferred from the available context.",
+            importance="medium",
+            confidence="low",
+            source="system_derived",
+            status="candidate",
+            evidence_message_ids=[state.get("message_id", "")],
+        )], "statement")
+        return {
+            "brief": brief.model_dump(mode="json"),
+            "existing_options": [*combined, *generated],
+            "new_options": [*state.get("new_options", []), *generated],
+        }
+
     def critique_recommendation(state: GraphState) -> dict[str, Any]:
         """Stress-test grounding before any recommendation reaches the user."""
         result = state.get("recommendation") or {}
 
-        def add_caveat(warning: str) -> None:
-            current = str(result.get("caveat") or "").strip()
-            if warning not in current:
-                result["caveat"] = f"{current} {warning}".strip()
-
         options = {
-            str(option["id"]): option for option in state.get("existing_options", [])
-            if option.get("status") != "rejected"
+            str(option["id"]): option for option in _actionable_options(state.get("existing_options", []))
         }
         selected_id = str(result.get("selected_option_id") or "")
         if selected_id not in options:
@@ -548,25 +754,19 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
             for preference in active_preferences
         )
         if not has_option_specific_evidence:
-            evidence_warning = (
-                "The information gathered does not establish that one option will perform better than the others. "
-                "Treat this as a conditional recommendation, not a factual comparison."
-            )
-            add_caveat(evidence_warning)
+            result["caveat"] = "This is a conditional recommendation because the available evidence does not clearly distinguish every option."
             result["robustness"] = "low"
         if not brief.readiness.enough_to_recommend:
             unresolved = brief.readiness.blockers or [
                 gap.reason for gap in brief.missing_information
             ]
-            warning = (
-                "This recommendation was made before every useful detail was resolved. "
-                + ("Remaining uncertainty: " + "; ".join(unresolved[:3]) if unresolved else "Treat it as provisional.")
-            )
-            add_caveat(warning)
+            if unresolved:
+                existing = list(result.get("unresolved_uncertainties") or [])
+                result["unresolved_uncertainties"] = list(dict.fromkeys([*existing, *unresolved[:3]]))
+            result["caveat"] = "Remaining uncertainty: some decision-relevant details are unresolved, so treat this recommendation as tentative."
             result["robustness"] = "low"
         if len(result["option_assessments"]) < len(options):
-            warning = "Some options lack a complete assessment; review the comparison before acting."
-            add_caveat(warning)
+            result["caveat"] = "The comparison is incomplete for one or more options, so review it before acting."
             result["robustness"] = "low"
         return {"recommendation": result}
 
@@ -587,21 +787,25 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
                 sentence_end = summary.find(".")
                 summary = summary[sentence_end + 1:].strip() if sentence_end >= 0 else ""
                 break
-        reply = f"My recommendation is {result.selected_option_title}."
+        concrete_recommendation = (result.concrete_example or "").strip().rstrip(".")
+        recommendation_label = concrete_recommendation or _short_option_label(result.selected_option_title)
+        reply = f"I recommend {recommendation_label}."
         if summary:
             reply += f" {summary}"
-        if result.caveat:
-            reply += f"\n\nImportant caveat: {result.caveat}"
         return {"brief": brief.model_dump(mode="json"), "recommendation": result.model_dump(mode="json"), "assistant_reply": reply}
 
     def route_after_action(state: GraphState) -> str:
-        return "evaluate_options" if state["selected_action"]["action"] == "recommend" else "generate_question"
+        if state["selected_action"]["action"] != "recommend":
+            return "generate_question"
+        combined = [*state.get("existing_options", []), *state.get("new_options", [])]
+        return "evaluate_options" if len(_actionable_options(combined)) >= 2 else "infer_immediate_options"
 
     graph = StateGraph(GraphState)
     graph.add_node("extract_observations", extract)
     graph.add_node("update_decision_state", update_state)
     graph.add_node("choose_next_action", choose_action)
     graph.add_node("generate_question", formulate_question)
+    graph.add_node("infer_immediate_options", infer_options_for_immediate_recommendation)
     graph.add_node("evaluate_options", evaluate_options)
     graph.add_node("critique_recommendation", critique_recommendation)
     graph.add_node("write_recommendation", write_recommendation)
@@ -610,6 +814,7 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
     graph.add_edge("update_decision_state", "choose_next_action")
     graph.add_conditional_edges("choose_next_action", route_after_action)
     graph.add_edge("generate_question", END)
+    graph.add_edge("infer_immediate_options", "evaluate_options")
     graph.add_edge("evaluate_options", "critique_recommendation")
     graph.add_edge("critique_recommendation", "write_recommendation")
     graph.add_edge("write_recommendation", END)
