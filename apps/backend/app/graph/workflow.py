@@ -236,6 +236,15 @@ def _signals_repeated_question(message: str) -> bool:
     ))
 
 
+def _rejects_current_suggested_options(message: str) -> bool:
+    normalized = _normalized(message)
+    rejection_phrases = (
+        "these are not", "those are not", "wrong options", "different options",
+        "not lunch", "not breakfast", "not dinner", "not options",
+    )
+    return any(phrase in normalized for phrase in rejection_phrases)
+
+
 def _snapshot_for_supersession(brief: DecisionBrief) -> dict[str, Any]:
     return {
         "revision": brief.revision,
@@ -494,6 +503,23 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
                     rationale="The user confirmed they want the offered evaluation; disclose any missing information as caveats.",
                     utility=1,
                 )
+            elif (
+                _rejects_current_suggested_options(state["user_message"])
+                and brief.next_action is not None
+                and brief.next_action.category == "options"
+            ):
+                action = ActionPlan(
+                    action="ask_clarification",
+                    category="options",
+                    target_field="options",
+                    expected_answer_type="list_of_options",
+                    rationale=(
+                        "The user rejected the current options as a mismatch. "
+                        "Collect two specific alternatives before evaluating."
+                    ),
+                    utility=1,
+                    attempt=(brief.next_action.attempt + 1),
+                )
             elif brief.readiness.enough_to_recommend:
                 action = ActionPlan(
                     action="evaluate", category="evaluation", target_field="recommendation_consent",
@@ -504,6 +530,7 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
                 _clarification_count(brief)
                 >= _clarification_limit(brief, settings.decision_max_clarification_turns)
                 and active_option_count >= 2
+                and not _rejects_current_suggested_options(state["user_message"])
             ):
                 action = ActionPlan(
                     action="evaluate", category="evaluation", target_field="recommendation_consent",

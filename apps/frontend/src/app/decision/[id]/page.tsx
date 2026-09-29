@@ -96,6 +96,17 @@ export default async function SavedDecisionPage({ params, searchParams }: {
     risks?: BriefItem[];
     contradictions?: Array<{ id: string; topic: string; previous_value: string; new_value: string; status: string }>;
     readiness?: { score?: number };
+    recommendation_versions?: Array<{
+      revision?: number;
+      source?: "initial" | "revision" | "upheld";
+      summary?: string | null;
+      feedback?: string | null;
+      change_note?: string | null;
+      recommendation?: {
+        selected_option_title?: string;
+        concrete_example?: string | null;
+      };
+    }>;
   };
   const recommendation = decision.recommendation as null | {
     selected_option_title?: string;
@@ -122,10 +133,17 @@ export default async function SavedDecisionPage({ params, searchParams }: {
     }>;
   };
   const latestAssistant = [...decision.messages].reverse().find((message) => message.role === "assistant");
+  const workflowError = String(latestAssistant?.structured_data?.workflow_error ?? "");
   const awaitingReply = decision.status !== "completed"
     && decision.messages.length > 0
     && decision.messages[decision.messages.length - 1]?.role === "user";
   const retryAvailable = latestAssistant?.structured_data?.retry_available === true && decision.status !== "completed";
+  const workflowBlocked = ["budget_exhausted", "revision_pending"].includes(workflowError);
+  const blockedMessage = workflowError === "revision_pending"
+    ? "Your feedback is saved. Tap Retry workflow to apply it."
+    : workflowError === "budget_exhausted"
+      ? "AI budget reached for this decision. Continue by editing options or start a new decision."
+      : "The workflow is paused. Retry workflow to continue.";
   const visibleOptions = decision.options.filter((option) => option.status !== "rejected");
   const hasCompletedExchange = decision.messages.some((message) => message.role === "user")
     && decision.messages.some((message) => message.role === "assistant")
@@ -147,6 +165,7 @@ export default async function SavedDecisionPage({ params, searchParams }: {
   const valueLabels = new Set(displayValues.map(normalizedLabel));
   const remainingCriteria = activeCriteria.filter((item) => !valueLabels.has(normalizedLabel(item)));
   const displayStatus = decision.status === "completed" ? "completed" : recommendation ? "recommended" : decision.status;
+  const recommendationHistory = [...(brief.recommendation_versions ?? [])].reverse();
 
   return (
     <section className="mx-auto max-w-5xl">
@@ -165,8 +184,12 @@ export default async function SavedDecisionPage({ params, searchParams }: {
             messages={decision.messages}
             awaitingReply={awaitingReply}
             showRecommendNow={showRecommendNow}
-            readOnly={decision.status === "completed" || retryAvailable}
-            readOnlyMessage={retryAvailable ? "The workflow is paused at a failed stage. Retry it before sending another message." : undefined}
+            readOnly={decision.status === "completed" || retryAvailable || workflowBlocked}
+            readOnlyMessage={
+              retryAvailable || workflowBlocked
+                ? blockedMessage
+                : undefined
+            }
           />
           {retryAvailable && <form action={retryWorkflow.bind(null, decision.id)} className="mt-3"><button className="rounded-lg bg-brand-primary px-4 py-2 text-sm font-medium text-white">Retry workflow</button></form>}
         </article>
@@ -365,6 +388,43 @@ export default async function SavedDecisionPage({ params, searchParams }: {
               {!!recommendation.assumptions?.length && <p className="mt-2 text-sm text-brand-muted"><strong>Assumptions:</strong> {recommendation.assumptions.map(displayText).join(" · ")}</p>}
               {!!recommendation.unresolved_uncertainties?.length && <p className="mt-2 text-sm text-brand-muted"><strong>Still uncertain:</strong> {recommendation.unresolved_uncertainties.map(displayText).join(" · ")}</p>}
             </details>
+          )}
+
+          {!!recommendationHistory.length && (
+            <section className="mt-5 border-t border-brand-border pt-4">
+              <h3 className="font-semibold text-brand-text">Recommendation history</h3>
+              <div className="mt-3 grid gap-2">
+                {recommendationHistory.map((entry, index) => {
+                  const headline = entry.recommendation?.concrete_example
+                    ? displayText(entry.recommendation.concrete_example)
+                    : shortOptionLabel(entry.recommendation?.selected_option_title ?? "Recommendation");
+                  const sourceLabel = entry.source === "upheld"
+                    ? "Upheld"
+                    : entry.source === "revision"
+                      ? "Revision"
+                      : "Initial";
+                  return (
+                    <details key={`${entry.revision ?? index}-${sourceLabel}`} className="surface-panel p-3 text-sm">
+                      <summary className="cursor-pointer">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <p className="font-medium text-brand-text">{headline}</p>
+                          <span className="rounded-md bg-brand-soft px-2 py-1 text-[11px] font-medium text-brand-muted">
+                            {sourceLabel}{typeof entry.revision === "number" ? ` · r${entry.revision}` : ""}
+                          </span>
+                        </div>
+                      </summary>
+                      {entry.change_note && <p className="mt-2 text-brand-muted">{displayText(entry.change_note)}</p>}
+                      {entry.summary && <p className="mt-1 text-brand-muted">{displayText(entry.summary)}</p>}
+                      {entry.feedback && (
+                        <p className="mt-1 text-xs text-brand-muted">
+                          <strong className="font-medium text-brand-text">Feedback:</strong> {displayText(entry.feedback)}
+                        </p>
+                      )}
+                    </details>
+                  );
+                })}
+              </div>
+            </section>
           )}
         </article>
       )}

@@ -10,7 +10,6 @@ from groq import AsyncGroq, BadRequestError, RateLimitError
 from pydantic import BaseModel, Field
 
 from app.core.config import Settings
-from app.core.text import normalize_decision_wording
 from app.graph.state import (
     ActionPlan,
     DecisionRisk,
@@ -126,6 +125,28 @@ class RecommendationDraft(BaseModel):
     caveat: str | None = None
 
 
+class RecommendationCompactDraft(BaseModel):
+    selected_option_id: str
+    summary: str
+    concrete_example: str = Field(min_length=3)
+    rationale: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    unresolved_uncertainties: list[str] = Field(default_factory=list)
+    robustness: str = "low"
+    caveat: str | None = None
+
+
+class RevisionIntentDraft(BaseModel):
+    action: Literal["revise", "uphold"]
+    acknowledgement: str
+    reasoning: str
+    extracted_feedback: list[str] = Field(default_factory=list)
+
+
+class TitleNormalizationDraft(BaseModel):
+    title: str
+
+
 def _strict_response_format(name: str, model: type[BaseModel]) -> dict:
     """Build a Groq-compatible strict JSON schema from a Pydantic model."""
     schema = model.model_json_schema()
@@ -155,6 +176,14 @@ def _is_json_validation_failure(exc: Exception) -> bool:
         return False
     body = getattr(exc, "body", None)
     return "json_validate_failed" in json.dumps(body or {}).lower() or "json" in str(exc).lower()
+
+
+def _is_truncation_validation_failure(exc: Exception) -> bool:
+    if not _is_json_validation_failure(exc):
+        return False
+    _status, _code, message, _headers = _provider_error_details(exc)
+    lowered = message.lower()
+    return "max completion tokens reached" in lowered or "truncated" in lowered
 
 
 def _provider_error_details(exc: Exception) -> tuple[int | None, str | None, str, dict[str, str]]:
@@ -565,15 +594,24 @@ async def _complete_structured(
         except Exception as exc:
             last_error = exc
             _log_provider_error(model, exc, stage=stage)
+            if _is_truncation_validation_failure(exc):
+                # A truncated strict JSON response is unlikely to repair well on
+                # the same constrained model and often burns extra OTPM. Move
+                # to the next configured model immediately.
+                continue
             failed = _failed_generation(exc) if _is_json_validation_failure(exc) else None
             if repair_used or not failed:
                 continue
             repair_used = True
+            repair_limit = min(int(kwargs.get("max_completion_tokens", 500)), 600)
+            repair_limit = _safe_completion_token_limit(model, repair_limit)
+            if model.startswith("qwen/"):
+                repair_limit = min(repair_limit, 260)
             repair_kwargs = {
                 "messages": _repair_messages(schema_name, failed, response_model),
                 "temperature": 0,
                 "response_format": {"type": "json_object"},
-                "max_completion_tokens": min(int(kwargs.get("max_completion_tokens", 500)), 600),
+                "max_completion_tokens": repair_limit,
             }
             if model.startswith("openai/gpt-oss-"):
                 repair_kwargs["reasoning_effort"] = "low"
@@ -824,10 +862,11 @@ EXTRACTION_PROMPT = """Extract only facts stated or directly implied by the newe
 message into the requested compact JSON object. Treat a short reply as decision
 input when pending_question shows that it answers the coach. Use plain strings for
 facts and string arrays for fact lists. Do not copy unchanged facts from current_state.
-When setting goal, silently normalize obvious spelling, transposed-letter, and
-accidental word-boundary errors while preserving the user's meaning. The goal is
-clean display text, not a verbatim transcript. Do not apply that rewriting to
-options, preferences, names, brands, or other user-provided facts.
+When setting goal, return a concise, polished UI heading that preserves the user's
+meaning. Proofread spelling, grammar, capitalization, punctuation, transposed
+letters, and accidental whitespace inside words. Do not merely copy malformed
+input into goal. Do not apply that rewriting to options, preferences, names,
+brands, or other user-provided facts.
 Set is_decision_input=false for greetings, unrelated requests, incoherent text,
 or content that does not describe or advance a decision. Set direction_change
 only when the user explicitly replaces the central decision, not when they add
@@ -892,7 +931,7 @@ def _extraction_patch_from_draft(draft: ExtractionDraft, message_id: str) -> Dec
         "direction_change": draft.direction_change,
         "direction_change_summary": draft.direction_change_summary,
         "decision_stakes": stakes,
-        "goal": fact(normalize_decision_wording(draft.goal) if draft.goal else None),
+        "goal": fact(draft.goal),
         "domain": fact(draft.domain),
         "deadline": fact(draft.deadline),
         "values": facts(draft.values),
@@ -991,7 +1030,7 @@ async def extract_decision_patch(
     elif not current_brief.get("goal"):
         fallback = DecisionStatePatch(
             goal={
-                "value": normalize_decision_wording(message),
+                "value": " ".join(message.strip().split()),
                 "source": "explicit",
                 "confidence": "high",
                 "evidence_message_ids": [message_id],
@@ -1026,11 +1065,11 @@ async def extract_decision_patch(
         if not draft.selected_option_title:
             parsed = _merge_explicit_options(parsed, message, current_brief)
         return _merge_contextual_answer(parsed, message, message_id, current_brief)
-    _check_budget(current_brief, payload, settings.extraction_max_tokens, settings)
-    client = AsyncGroq(
-        api_key=settings.groq_api_key.get_secret_value(), timeout=20.0, max_retries=0
-    )
     try:
+        _check_budget(current_brief, payload, settings.extraction_max_tokens, settings)
+        client = AsyncGroq(
+            api_key=settings.groq_api_key.get_secret_value(), timeout=20.0, max_retries=0
+        )
         completion, used_model, draft, content = await _complete_structured(
             client, [settings.groq_light_model, settings.groq_light_fallback_model],
             stage="extraction",
@@ -1051,8 +1090,9 @@ async def extract_decision_patch(
         if not draft.selected_option_title:
             parsed = _merge_explicit_options(parsed, message, current_brief)
         return _merge_contextual_answer(parsed, message, message_id, current_brief)
-    except (DecisionLLMRateLimitError, DecisionLLMBudgetError):
-        raise
+    except (DecisionLLMRateLimitError, DecisionLLMBudgetError, DecisionLLMGenerationError):
+        fallback = _merge_explicit_options(fallback, message, current_brief)
+        return _merge_contextual_answer(fallback, message, message_id, current_brief)
     except Exception:
         fallback = _merge_explicit_options(fallback, message, current_brief)
         return _merge_contextual_answer(fallback, message, message_id, current_brief)
@@ -1061,7 +1101,9 @@ async def extract_decision_patch(
 QUESTION_PROMPT = """Write one concise, natural clarification question for a
 personal decision. Sound like a warm, perceptive decision coach rather than a
 form or an interviewer. If this is the first question, briefly acknowledge what
-the person is trying to do before asking it. For a meaningful personal choice,
+the person is trying to do before asking it. If this is not the first question,
+do not restate the decision framing with openers such as "I hear you're looking
+for..." or "You're deciding...". For a meaningful personal choice,
 the acknowledgment may be gently encouraging, but never invent an emotion or
 overdo enthusiasm. The workflow has already selected what information to seek;
 do not choose a different target and do not evaluate or recommend. Use the goal,
@@ -1117,6 +1159,26 @@ def _normalize_question_payload(payload: dict) -> dict:
     return normalized
 
 
+def _trim_repeated_acknowledgement(question: str, *, is_first_question: bool) -> str:
+    """Remove repetitive framing openers from non-first clarifications."""
+    cleaned = " ".join(question.strip().split())
+    if is_first_question:
+        return cleaned
+    patterns = (
+        r"^i hear you(?:'|’)?re looking for[^,.!?—-]*[,.!?—-]\s*",
+        r"^you(?:'|’)?re looking for[^,.!?—-]*[,.!?—-]\s*",
+        r"^you are looking for[^,.!?—-]*[,.!?—-]\s*",
+        r"^you(?:'|’)?re deciding[^,.!?—-]*[,.!?—-]\s*",
+        r"^you are deciding[^,.!?—-]*[,.!?—-]\s*",
+    )
+    for pattern in patterns:
+        candidate = re.sub(pattern, "", cleaned, count=1, flags=re.IGNORECASE).strip()
+        if candidate and candidate != cleaned:
+            cleaned = candidate
+            break
+    return cleaned
+
+
 def _question_advances_target(draft: QuestionDraft) -> bool:
     """Reject questions that clearly gather a different kind of information.
 
@@ -1154,6 +1216,8 @@ def _question_validation_errors(
     errors: list[str] = []
     if question in previous:
         errors.append("it repeats a previous question")
+    elif any(_lexical_similarity(question, item) >= 0.9 for item in previous):
+        errors.append("it nearly repeats a previous question")
     if "?" not in draft.question:
         errors.append("it is not phrased as a question")
     if draft.target_field == "uncertainties" and any(
@@ -1182,6 +1246,168 @@ def _question_validation_errors(
     if not _question_advances_target(draft):
         errors.append(f"it asks for information outside the {draft.target_field} target")
     return errors
+
+
+def _normalized_sentence(value: str) -> str:
+    return " ".join(value.lower().split())
+
+
+def _lexical_similarity(left: str, right: str) -> float:
+    left_tokens = set(re.findall(r"[a-z0-9]+", left.lower()))
+    right_tokens = set(re.findall(r"[a-z0-9]+", right.lower()))
+    if not left_tokens or not right_tokens:
+        return 0.0
+    overlap = len(left_tokens & right_tokens)
+    return overlap / max(1, min(len(left_tokens), len(right_tokens)))
+
+
+def _message_rejects_previous_suggestions(message: str) -> bool:
+    normalized = _normalized_sentence(message)
+    if not normalized:
+        return False
+    rejection_patterns = (
+        "these are not",
+        "those are not",
+        "not lunch",
+        "not breakfast",
+        "not dinner",
+        "wrong options",
+        "different options",
+        "other options",
+    )
+    return any(pattern in normalized for pattern in rejection_patterns)
+
+
+def _meal_type_from_context(goal_text: str, latest_message: str) -> str | None:
+    context = f"{goal_text} {latest_message}".lower()
+    if "lunch" in context:
+        return "lunch"
+    if "dinner" in context:
+        return "dinner"
+    if "breakfast" in context:
+        return "breakfast"
+    if any(term in context for term in ("meal", "eat", "cook", "food")):
+        return "meal"
+    return None
+
+
+def _fallback_clarification_question(
+    action: ActionPlan,
+    brief: dict,
+    *,
+    latest_message: str = "",
+    forbidden: list[str | None] | None = None,
+) -> QuestionDraft:
+    """Return a safe deterministic question when model output is invalid."""
+    target = action.target_field or action.category
+    goal_text = ""
+    goal = brief.get("goal")
+    if isinstance(goal, dict):
+        goal_text = str(goal.get("value") or "").strip()
+    forbidden_normalized = {
+        _normalized_sentence(str(item))
+        for item in (forbidden or [])
+        if item
+    }
+
+    def fallback_meal_suggestions(meal_type: str | None) -> list[OptionObservation]:
+        preference_text = " ".join(
+            str(item.get("value") or "")
+            for item in brief.get("preference_signals", [])
+            if isinstance(item, dict)
+        ).lower()
+        if meal_type == "lunch":
+            candidates = [
+                "Chicken and veggie grain bowl",
+                "Salmon salad with avocado and quinoa",
+            ]
+        elif meal_type == "dinner":
+            candidates = [
+                "Baked salmon with roasted vegetables",
+                "Turkey chili with mixed beans",
+            ]
+        elif "egg" in preference_text:
+            candidates = [
+                "Scrambled eggs with spinach",
+                "Egg-and-avocado whole-grain toast",
+            ]
+        elif "healthy" in preference_text:
+            candidates = [
+                "Oatmeal with berries and nuts",
+                "Veggie omelet with whole-grain toast",
+            ]
+        else:
+            candidates = [
+                "Greek yogurt bowl with fruit",
+                "Peanut-butter banana whole-grain toast",
+            ]
+        return [
+            OptionObservation(
+                title=title,
+                description=None,
+                source="ai_generated",
+                kind="alternative",
+                specificity="actionable",
+            )
+            for title in candidates
+        ]
+
+    suggested_options: list[OptionObservation] = []
+    if target in {"options", "concrete_options"}:
+        meal_type = _meal_type_from_context(goal_text, latest_message)
+        if _message_rejects_previous_suggestions(latest_message):
+            meal_label = f" {meal_type}" if meal_type in {"breakfast", "lunch", "dinner"} else ""
+            question = (
+                "Understood. Please share two specific"
+                f"{meal_label} options you would actually choose between, and I will compare them directly."
+            )
+        elif meal_type:
+            suggested_options = fallback_meal_suggestions(meal_type)
+            left, right = suggested_options[0].title, suggested_options[1].title
+            question = (
+                f"I can compare {left} vs {right}. Want me to evaluate these now, "
+                "or do you want to share two specific options of your own?"
+            )
+        elif goal_text:
+            question = (
+                f"To decide \"{goal_text}\", what are two specific options you want compared?"
+            )
+        else:
+            question = "What are two specific options you want compared?"
+    elif target == "criterion_importance":
+        question = "How important is each of the factors you already named, on a 1-5 scale?"
+    elif target == "constraints":
+        question = "What hard limits should any good option respect?"
+    elif target == "uncertainties":
+        question = "What unknowns could still change your choice?"
+    elif target == "values":
+        question = "What matters most to you for this decision right now?"
+    elif target == "risk_tolerance":
+        question = "How much downside risk are you comfortable with for this choice?"
+    elif target == "decision_context":
+        question = "What one detail about your situation would most change this decision?"
+    elif target == "recommendation_consent":
+        question = "I have enough context for a provisional recommendation. Do you want it now?"
+    else:
+        question = "What single detail would most help narrow this decision?"
+
+    if (
+        _normalized_sentence(question) in forbidden_normalized
+        or any(_lexical_similarity(question, item) >= 0.9 for item in forbidden_normalized)
+    ):
+        if target in {"options", "concrete_options"}:
+            question = "Please share two concrete options you actually want compared right now."
+            suggested_options = []
+        else:
+            question = "Could you share one new detail that would help narrow the decision?"
+
+    return QuestionDraft(
+        question=question,
+        target_field=target,
+        expected_answer_type=action.expected_answer_type or "short_text",
+        acknowledges_answer=False,
+        suggested_options=[item.model_dump(mode="json") for item in suggested_options],
+    )
 
 
 async def generate_clarification_question(
@@ -1214,8 +1440,12 @@ async def generate_clarification_question(
 
     def parse_question(raw: dict[str, Any]) -> QuestionDraft:
         provider = QuestionResponseDraft.model_validate(_normalize_question_payload(raw))
+        question_text = _trim_repeated_acknowledgement(
+            provider.question,
+            is_first_question=bool(payload["is_first_question"]),
+        )
         draft = QuestionDraft(
-            question=provider.question,
+            question=question_text,
             target_field=action.target_field or action.category,
             expected_answer_type=action.expected_answer_type or "short_text",
             acknowledges_answer=provider.acknowledges_answer,
@@ -1229,9 +1459,16 @@ async def generate_clarification_question(
         )
         validation_errors = _question_validation_errors(draft, forbidden)
         if validation_errors:
-            raise ValueError(
-                f"Question validation failed for target={draft.target_field}: "
-                + "; ".join(validation_errors)
+            logger.warning(
+                "Question validation failed for target=%s: %s; using deterministic fallback",
+                draft.target_field,
+                "; ".join(validation_errors),
+            )
+            return _fallback_clarification_question(
+                action,
+                brief,
+                latest_message=latest_message,
+                forbidden=forbidden,
             )
         return draft
 
@@ -1241,23 +1478,31 @@ async def generate_clarification_question(
         except Exception:
             logger.warning("Ignoring invalid cached clarification question")
 
-    _check_budget(brief, payload, settings.question_max_tokens, settings)
-    await asyncio.sleep(settings.llm_stage_delay_seconds)
-    completion, model, draft, content = await _complete_structured(
-        client, [settings.groq_light_model, settings.groq_light_fallback_model],
-        stage="question",
-        schema_name="clarification_question",
-        response_model=QuestionResponseDraft,
-        parse=parse_question,
-        messages=[
-            {"role": "system", "content": QUESTION_PROMPT},
-            {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
-        ],
-        temperature=0.35,
-        max_completion_tokens=settings.question_max_tokens,
-    )
-    _record_completion(brief, completion, key, content, model, settings)
-    return draft
+    try:
+        _check_budget(brief, payload, settings.question_max_tokens, settings)
+        await asyncio.sleep(settings.llm_stage_delay_seconds)
+        completion, model, draft, content = await _complete_structured(
+            client, [settings.groq_light_model, settings.groq_light_fallback_model],
+            stage="question",
+            schema_name="clarification_question",
+            response_model=QuestionResponseDraft,
+            parse=parse_question,
+            messages=[
+                {"role": "system", "content": QUESTION_PROMPT},
+                {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
+            ],
+            temperature=0.35,
+            max_completion_tokens=settings.question_max_tokens,
+        )
+        _record_completion(brief, completion, key, content, model, settings)
+        return draft
+    except (DecisionLLMRateLimitError, DecisionLLMBudgetError, DecisionLLMGenerationError):
+        return _fallback_clarification_question(
+            action,
+            brief,
+            latest_message=latest_message,
+            forbidden=forbidden,
+        )
 
 
 IMMEDIATE_OPTIONS_PROMPT = """Infer two or three concrete, mutually exclusive
@@ -1391,6 +1636,35 @@ uncertainties; two risks; two checks; and two sensitivity factors. Each item and
 the summary must be a single concise sentence."""
 
 
+REVISION_INTENT_PROMPT = """You are classifying feedback on an existing
+recommendation. Return JSON only.
+Choose action=revise when the person reports mismatch with stated preferences,
+constraints, tone, specificity, or usefulness (for example: too formal, too
+generic, not actionable, not aligned with their responses).
+Choose action=uphold when the feedback does not conflict with the available
+facts/preferences or asks to ignore important constraints.
+acknowledgement must validate the feedback respectfully in one sentence.
+reasoning must be brief, specific, and grounded in the provided decision brief.
+extracted_feedback should contain short bullet-like strings that can be merged as
+preference signals or constraints for a revision."""
+
+
+REVISION_RECOMMENDATION_PROMPT = """Revise the recommendation after user
+feedback using only supplied options and decision brief. Return JSON matching the
+same recommendation schema as initial recommendations.
+Honor explicit corrections from feedback. Do not invent new options, facts, or
+objective claims. Keep the response concise and actionable. The selected option
+ID must reference a supplied option.
+If the current recommendation is still best, keep it but improve specificity and
+alignment with feedback context."""
+
+
+TITLE_NORMALIZATION_PROMPT = """Rewrite the title as a concise, polished
+decision heading. Fix typos, broken spacing inside words, capitalization, and
+punctuation while preserving meaning. Do not add new facts. Keep it under
+60 characters when possible. Return JSON only with {\"title\": \"...\"}."""
+
+
 def _as_string_list(value) -> list[str]:
     if value is None:
         return []
@@ -1467,6 +1741,39 @@ def _recommendation_from_draft(draft: RecommendationDraft) -> RecommendationResu
     return RecommendationResult.model_validate(_normalize_recommendation_payload(raw))
 
 
+def _recommendation_from_compact_draft(draft: RecommendationCompactDraft) -> RecommendationResult:
+    return RecommendationResult(
+        selected_option_id=draft.selected_option_id,
+        selected_option_title=draft.selected_option_id,
+        summary=draft.summary,
+        concrete_example=draft.concrete_example,
+        rationale=draft.rationale or ["This option is the strongest fit based on the available evidence."],
+        assumptions=draft.assumptions,
+        unresolved_uncertainties=draft.unresolved_uncertainties,
+        robustness=(
+            draft.robustness.lower()
+            if draft.robustness.lower() in {"low", "moderate", "high"}
+            else "low"
+        ),
+        caveat=draft.caveat,
+    )
+
+
+def _parse_recommendation_cached_result(
+    content: str,
+    confirmed_selection: dict | None = None,
+) -> RecommendationResult:
+    try:
+        draft = RecommendationDraft.model_validate_json(content)
+        draft = _validate_recommendation_selection(draft, confirmed_selection)
+        return _recommendation_from_draft(draft)
+    except Exception:
+        compact = RecommendationCompactDraft.model_validate_json(content)
+        if confirmed_selection and compact.selected_option_id != str(confirmed_selection["id"]):
+            raise ValueError("The recommendation must preserve the user's confirmed option selection.")
+        return _recommendation_from_compact_draft(compact)
+
+
 def _confirmed_actionable_selection(brief: dict, options: list[dict]) -> dict | None:
     """Resolve the newest explicit option selection to a concrete persisted option."""
     option_by_title = {
@@ -1498,6 +1805,51 @@ def _validate_recommendation_selection(
     return draft
 
 
+def _fallback_recommendation_from_options(
+    brief: dict,
+    options: list[dict],
+    *,
+    caveat: str,
+) -> RecommendationResult | None:
+    actionable = [option for option in options if option.get("status") != "rejected"]
+    if len(actionable) < 2:
+        return None
+    selected = actionable[0]
+    selected_id = str(selected.get("id") or "")
+    selected_title = str(selected.get("title") or "the first option")
+    values = [
+        str(item.get("value") or "")
+        for item in brief.get("values", [])
+        if isinstance(item, dict) and item.get("status") != "rejected"
+    ]
+    constraints = [
+        str(item.get("value") or "")
+        for item in brief.get("constraints", [])
+        if isinstance(item, dict) and item.get("status") != "rejected"
+    ]
+    value_hint = values[0] if values else "your stated priorities"
+    constraint_hint = constraints[0] if constraints else "your practical constraints"
+    alternative = next(
+        (str(option.get("title") or "") for option in actionable[1:] if option.get("title")),
+        "the other option",
+    )
+    return RecommendationResult(
+        selected_option_id=selected_id,
+        selected_option_title=selected_title,
+        summary=(
+            f"Start with {_short_option_label(selected_title)} as a provisional choice while we stay within the current AI usage limit."
+        ),
+        concrete_example=selected_title,
+        rationale=[
+            f"It is the safest default given {value_hint}.",
+            f"It is less likely to violate {constraint_hint}.",
+        ],
+        alternate_recommendation=f"If this underperforms, switch to {_short_option_label(alternative)}.",
+        robustness="low",
+        caveat=caveat,
+    )
+
+
 async def generate_grounded_recommendation(
     brief: dict,
     options: list[dict],
@@ -1518,18 +1870,24 @@ async def generate_grounded_recommendation(
         ),
     }
     key = _cache_key("recommendation", payload)
+    recommendation_token_limit = min(settings.recommendation_max_tokens, 520)
     cached = _cached_content(brief, key, settings)
     if cached:
         try:
-            draft = _validate_recommendation_selection(
-                RecommendationDraft.model_validate_json(cached), confirmed_selection
-            )
-            result = _recommendation_from_draft(draft)
+            result = _parse_recommendation_cached_result(cached, confirmed_selection)
         except Exception:
             logger.warning("Ignoring cached recommendation that no longer satisfies the output contract")
             cached = None
     if not cached:
-        _check_budget(brief, payload, settings.recommendation_max_tokens, settings)
+        try:
+            _check_budget(brief, payload, recommendation_token_limit, settings)
+        except DecisionLLMBudgetError:
+            logger.warning("Recommendation budget exhausted; using deterministic fallback recommendation")
+            return _fallback_recommendation_from_options(
+                brief,
+                options,
+                caveat="AI token budget reached for this decision, so this is a conservative provisional recommendation.",
+            )
         client = AsyncGroq(
             api_key=settings.groq_api_key.get_secret_value(), timeout=30.0, max_retries=0
         )
@@ -1538,20 +1896,20 @@ async def generate_grounded_recommendation(
             completion, used_model, draft, content = await _complete_structured(
                 client, [settings.groq_model, settings.groq_recommendation_fallback_model],
                 stage="recommendation",
-                schema_name="decision_recommendation",
-                response_model=RecommendationDraft,
+                schema_name="decision_recommendation_compact",
+                response_model=RecommendationCompactDraft,
                 parse=lambda value: _validate_recommendation_selection(
-                    RecommendationDraft.model_validate(value), confirmed_selection
+                    RecommendationCompactDraft.model_validate(value), confirmed_selection
                 ),
                 messages=[
                     {"role": "system", "content": RECOMMENDATION_PROMPT},
                     {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
                 ],
                 temperature=0.1,
-                max_completion_tokens=settings.recommendation_max_tokens,
+                max_completion_tokens=recommendation_token_limit,
             )
             _record_completion(brief, completion, key, content, used_model, settings)
-            result = _recommendation_from_draft(draft)
+            result = _recommendation_from_compact_draft(draft)
         except (DecisionLLMRateLimitError, DecisionLLMBudgetError):
             raise
         except Exception as exc:
@@ -1588,3 +1946,148 @@ async def generate_grounded_recommendation(
             if risk.get("status") != "rejected"
         ]
     return _sanitize_recommendation(result, option_by_id)
+
+
+async def classify_revision_feedback(
+    brief: dict,
+    options: list[dict],
+    feedback: str,
+    recommendation: dict,
+    settings: Settings,
+) -> RevisionIntentDraft:
+    if not settings.groq_api_key:
+        raise DecisionLLMGenerationError("Revision classification requires an AI provider")
+    payload = {
+        "decision_brief": _compact_brief(brief),
+        "options": _compact_options(options),
+        "current_recommendation": recommendation,
+        "feedback": feedback,
+    }
+    key = _cache_key("revision_intent", payload)
+    cached = _cached_content(brief, key, settings)
+    if cached:
+        try:
+            return RevisionIntentDraft.model_validate_json(cached)
+        except Exception:
+            logger.warning("Ignoring invalid cached revision intent")
+
+    client = AsyncGroq(
+        api_key=settings.groq_api_key.get_secret_value(), timeout=20.0, max_retries=0
+    )
+    completion, model, draft, content = await _complete_structured(
+        client, [settings.groq_light_model, settings.groq_light_fallback_model],
+        stage="revision_intent",
+        schema_name="revision_intent",
+        response_model=RevisionIntentDraft,
+        parse=RevisionIntentDraft.model_validate,
+        messages=[
+            {"role": "system", "content": REVISION_INTENT_PROMPT},
+            {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
+        ],
+        temperature=0.1,
+        max_completion_tokens=min(settings.question_max_tokens, 260),
+    )
+    _record_completion(brief, completion, key, content, model, settings)
+    return draft
+
+
+async def generate_revised_recommendation(
+    brief: dict,
+    options: list[dict],
+    current_recommendation: dict,
+    feedback: str,
+    settings: Settings,
+) -> RecommendationResult | None:
+    if not settings.groq_api_key or len(options) < 2:
+        return None
+    payload = {
+        "decision_brief": _compact_brief(brief),
+        "options": _compact_options(options),
+        "current_recommendation": current_recommendation,
+        "feedback": feedback,
+    }
+    key = _cache_key("revision_recommendation", payload)
+    recommendation_token_limit = min(settings.recommendation_max_tokens, 520)
+    cached = _cached_content(brief, key, settings)
+    if cached:
+        try:
+            result = _parse_recommendation_cached_result(cached)
+        except Exception:
+            logger.warning("Ignoring invalid cached revised recommendation")
+            cached = None
+    if not cached:
+        client = AsyncGroq(
+            api_key=settings.groq_api_key.get_secret_value(), timeout=30.0, max_retries=0
+        )
+        try:
+            completion, model, draft, content = await _complete_structured(
+                client, [settings.groq_model, settings.groq_recommendation_fallback_model],
+                stage="revision_recommendation",
+                schema_name="revision_recommendation_compact",
+                response_model=RecommendationCompactDraft,
+                parse=RecommendationCompactDraft.model_validate,
+                messages=[
+                    {"role": "system", "content": REVISION_RECOMMENDATION_PROMPT},
+                    {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
+                ],
+                temperature=0.15,
+                max_completion_tokens=recommendation_token_limit,
+            )
+            _record_completion(brief, completion, key, content, model, settings)
+            result = _recommendation_from_compact_draft(draft)
+        except (DecisionLLMRateLimitError, DecisionLLMBudgetError):
+            raise
+        except Exception as exc:
+            logger.warning("Revision recommendation generation failed (%s): %s", type(exc).__name__, exc)
+            return None
+
+    option_by_id = {str(option["id"]): option for option in options if option.get("status") != "rejected"}
+    selected = option_by_id.get(result.selected_option_id)
+    if not selected:
+        return None
+    result.selected_option_title = str(selected["title"])
+    valid_assessments = []
+    for assessment in result.option_assessments:
+        option = option_by_id.get(assessment.option_id)
+        if option:
+            assessment.option_title = str(option["title"])
+            valid_assessments.append(assessment)
+    result.option_assessments = valid_assessments
+    return _sanitize_recommendation(result, option_by_id)
+
+
+async def normalize_title_with_ai(
+    title: str,
+    settings: Settings,
+) -> str | None:
+    if not settings.groq_api_key:
+        return None
+    candidate = " ".join(title.strip().split())
+    if not candidate:
+        return None
+    payload = {"title": candidate}
+    key = _cache_key("title_normalization", payload)
+    # Reuse a small temporary brief-like cache container so this call can use
+    # the same strict JSON helper without touching decision token budgets.
+    ephemeral: dict[str, Any] = {"llm_cache": {}}
+    client = AsyncGroq(
+        api_key=settings.groq_api_key.get_secret_value(), timeout=15.0, max_retries=0
+    )
+    completion, model, draft, content = await _complete_structured(
+        client, [settings.groq_light_model, settings.groq_light_fallback_model],
+        stage="title_normalization",
+        schema_name="title_normalization",
+        response_model=TitleNormalizationDraft,
+        parse=TitleNormalizationDraft.model_validate,
+        messages=[
+            {"role": "system", "content": TITLE_NORMALIZATION_PROMPT},
+            {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
+        ],
+        temperature=0,
+        max_completion_tokens=settings.title_normalization_max_tokens,
+    )
+    _record_completion(ephemeral, completion, key, content, model, settings)
+    normalized = " ".join(draft.title.strip().split())
+    if not normalized:
+        return None
+    return normalized[:200]
