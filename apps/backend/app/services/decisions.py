@@ -44,8 +44,11 @@ from app.llm.decision_assistant import (
     DecisionLLMGenerationError,
     DecisionLLMRateLimitError,
     classify_revision_feedback,
+    finish_llm_turn_trace,
     generate_revised_recommendation,
     normalize_title_with_ai,
+    start_llm_turn_trace,
+    summarize_llm_turn_trace,
     _short_option_label,
 )
 
@@ -288,6 +291,7 @@ class DecisionStore:
                 client, decision_id, "user", values.content, trusted_backend=False
             )
             if decision.recommendation:
+                trace_token = start_llm_turn_trace()
                 assistant_message = await self._handle_recommendation_revision(
                     client,
                     decision_id,
@@ -295,6 +299,14 @@ class DecisionStore:
                     decision.decision_brief,
                     [option.model_dump(mode="json") for option in decision.options],
                     decision.recommendation,
+                )
+                trace = finish_llm_turn_trace(trace_token)
+                llm_turn_summary = summarize_llm_turn_trace(trace)
+                await self._attach_llm_metrics_to_message(
+                    client,
+                    decision_id,
+                    assistant_message,
+                    llm_turn_summary,
                 )
             else:
                 assistant_message = await self._run_conversation_turn(
@@ -308,6 +320,30 @@ class DecisionStore:
             user_message=user_message,
             assistant_message=assistant_message,
         )
+
+    async def _attach_llm_metrics_to_message(
+        self,
+        client: httpx.AsyncClient,
+        decision_id: UUID,
+        message: DecisionMessage,
+        llm_turn_summary: dict[str, Any],
+    ) -> DecisionMessage:
+        if message.role != "assistant":
+            return message
+        merged = dict(message.structured_data or {})
+        merged["llm_metrics"] = llm_turn_summary
+        rows = await self._request(
+            client,
+            "PATCH",
+            "decision_messages",
+            params={"id": f"eq.{message.id}", "decision_id": f"eq.{decision_id}"},
+            json={"structured_data": merged},
+            prefer_representation=True,
+            trusted_backend=True,
+        )
+        if not rows:
+            return message
+        return DecisionMessage.model_validate(rows[0])
 
     async def _load_policy_profile(self, client: httpx.AsyncClient) -> ClarificationProfile:
         rows = await self._request(
@@ -653,6 +689,7 @@ class DecisionStore:
         update_title_from_goal: bool = False,
     ) -> DecisionMessage:
         profile = await self._load_policy_profile(client)
+        trace_token = start_llm_turn_trace()
         payload = {
                 "decision_id": str(decision_id),
                 "user_id": str(self.user.id),
@@ -671,33 +708,81 @@ class DecisionStore:
                 client, decision_id, "workflow_rate_limited", int(brief.get("revision", 0)),
                 {"message_id": str(user_message.id), "retryable": True},
             )
+            trace = finish_llm_turn_trace(trace_token)
+            await self._record_state_event(
+                client,
+                decision_id,
+                "llm_turn_metrics",
+                int(brief.get("revision", 0)),
+                {
+                    "message_id": str(user_message.id),
+                    "summary": summarize_llm_turn_trace(trace),
+                    "stages": trace,
+                },
+            )
             return await self._insert_message(
                 client, decision_id, "assistant",
                 "The AI service has reached its usage limit. Your progress is saved; please try Retry workflow later.",
                 trusted_backend=True,
-                structured_data={"workflow_error": "rate_limited", "retry_available": True},
+                structured_data={
+                    "workflow_error": "rate_limited",
+                    "retry_available": True,
+                    "llm_metrics": summarize_llm_turn_trace(trace),
+                },
             )
         except DecisionLLMBudgetError:
             await self._record_state_event(
                 client, decision_id, "workflow_budget_exhausted", int(brief.get("revision", 0)),
                 {"message_id": str(user_message.id), "retryable": False},
             )
+            trace = finish_llm_turn_trace(trace_token)
+            await self._record_state_event(
+                client,
+                decision_id,
+                "llm_turn_metrics",
+                int(brief.get("revision", 0)),
+                {
+                    "message_id": str(user_message.id),
+                    "summary": summarize_llm_turn_trace(trace),
+                    "stages": trace,
+                },
+            )
             return await self._insert_message(
                 client, decision_id, "assistant",
                 "This decision has reached its AI usage budget. Your progress is saved, but no additional model calls will be made.",
                 trusted_backend=True,
-                structured_data={"workflow_error": "budget_exhausted", "retry_available": False},
+                structured_data={
+                    "workflow_error": "budget_exhausted",
+                    "retry_available": False,
+                    "llm_metrics": summarize_llm_turn_trace(trace),
+                },
             )
         except DecisionLLMGenerationError:
             await self._record_state_event(
                 client, decision_id, "question_generation_unavailable", int(brief.get("revision", 0)),
                 {"message_id": str(user_message.id), "retryable": True},
             )
+            trace = finish_llm_turn_trace(trace_token)
+            await self._record_state_event(
+                client,
+                decision_id,
+                "llm_turn_metrics",
+                int(brief.get("revision", 0)),
+                {
+                    "message_id": str(user_message.id),
+                    "summary": summarize_llm_turn_trace(trace),
+                    "stages": trace,
+                },
+            )
             return await self._insert_message(
                 client, decision_id, "assistant",
                 "I couldn’t generate the next question right now. Your progress is saved; please try Retry workflow later.",
                 trusted_backend=True,
-                structured_data={"workflow_error": "question_unavailable", "retry_available": True},
+                structured_data={
+                    "workflow_error": "question_unavailable",
+                    "retry_available": True,
+                    "llm_metrics": summarize_llm_turn_trace(trace),
+                },
             )
         except Exception:
             logger.exception(
@@ -708,12 +793,41 @@ class DecisionStore:
                 client, decision_id, "workflow_failed", int(brief.get("revision", 0)),
                 {"message_id": str(user_message.id), "retryable": True},
             )
+            trace = finish_llm_turn_trace(trace_token)
+            await self._record_state_event(
+                client,
+                decision_id,
+                "llm_turn_metrics",
+                int(brief.get("revision", 0)),
+                {
+                    "message_id": str(user_message.id),
+                    "summary": summarize_llm_turn_trace(trace),
+                    "stages": trace,
+                },
+            )
             return await self._insert_message(
                 client, decision_id, "assistant",
                 "The workflow was interrupted after retrying. Your progress is saved at the failed stage; use Retry workflow to continue.",
                 trusted_backend=True,
-                structured_data={"workflow_error": "retryable", "retry_available": True},
+                structured_data={
+                    "workflow_error": "retryable",
+                    "retry_available": True,
+                    "llm_metrics": summarize_llm_turn_trace(trace),
+                },
             )
+        trace = finish_llm_turn_trace(trace_token)
+        llm_turn_summary = summarize_llm_turn_trace(trace)
+        await self._record_state_event(
+            client,
+            decision_id,
+            "llm_turn_metrics",
+            int(result.get("brief", {}).get("revision", brief.get("revision", 0))),
+            {
+                "message_id": str(user_message.id),
+                "summary": llm_turn_summary,
+                "stages": trace,
+            },
+        )
         previous_action = brief.get("next_action") or {}
         resolved = self._target_was_resolved(previous_action, brief, result, options)
         profile = await self._learn_from_previous_question(
@@ -728,6 +842,7 @@ class DecisionStore:
                 options,
                 profile,
                 result,
+                llm_turn_summary=llm_turn_summary,
                 update_title_from_goal=update_title_from_goal,
                 remove_resolved_errors=True,
             )
@@ -847,28 +962,47 @@ class DecisionStore:
                 "recommendation": {},
                 "recommendation_error": "",
             }
+            trace_token = start_llm_turn_trace()
             try:
                 # A retry starts from persisted application state instead of replaying
                 # a stale failed task from a checkpoint created by older code.
                 result = await self._invoke_graph(decision_id, payload, fresh=True)
             except DecisionLLMRateLimitError as exc:
+                finish_llm_turn_trace(trace_token)
                 raise HTTPException(
                     status_code=429,
                     detail="The AI service usage limit is still active. Please retry later.",
                 ) from exc
             except DecisionLLMBudgetError as exc:
+                finish_llm_turn_trace(trace_token)
                 raise HTTPException(
                     status_code=409,
                     detail="This decision has reached its AI usage budget.",
                 ) from exc
             except DecisionLLMGenerationError as exc:
+                finish_llm_turn_trace(trace_token)
                 raise HTTPException(
                     status_code=503,
                     detail="Question generation is temporarily unavailable. Please retry later.",
                 ) from exc
             except Exception as exc:
+                finish_llm_turn_trace(trace_token)
                 logger.exception("Fresh workflow retry failed for decision %s", decision_id)
                 raise HTTPException(status_code=503, detail="The workflow could not be retried") from exc
+            trace = finish_llm_turn_trace(trace_token)
+            llm_turn_summary = summarize_llm_turn_trace(trace)
+            await self._record_state_event(
+                client,
+                decision_id,
+                "llm_turn_metrics",
+                int(result.get("brief", {}).get("revision", decision.decision_brief.get("revision", 0))),
+                {
+                    "message_id": str(user_message.id),
+                    "summary": llm_turn_summary,
+                    "stages": trace,
+                    "retry": True,
+                },
+            )
             return await self._persist_graph_result(
                 client,
                 decision_id,
@@ -876,6 +1010,7 @@ class DecisionStore:
                 [option.model_dump(mode="json") for option in decision.options],
                 profile,
                 result,
+                llm_turn_summary=llm_turn_summary,
                 update_title_from_goal=True,
                 remove_resolved_errors=True,
             )
@@ -889,6 +1024,7 @@ class DecisionStore:
         profile: ClarificationProfile,
         result: dict[str, Any],
         *,
+        llm_turn_summary: dict[str, Any] | None = None,
         update_title_from_goal: bool = False,
         remove_resolved_errors: bool = False,
     ) -> DecisionMessage:
@@ -1065,6 +1201,7 @@ class DecisionStore:
                 "duplicate_options": result.get("duplicate_options", []),
                 "state_revision": updated_brief["revision"],
                 "workflow_error": result.get("recommendation_error"),
+                "llm_metrics": llm_turn_summary or {},
             },
         )
 

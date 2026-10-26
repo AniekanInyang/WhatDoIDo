@@ -1,8 +1,10 @@
 import asyncio
+import contextvars
 import json
 import hashlib
 import logging
 import re
+import time
 from collections.abc import Callable
 from typing import Any, Literal, TypeVar
 
@@ -24,6 +26,95 @@ from app.graph.state import (
 
 logger = logging.getLogger(__name__)
 StructuredModel = TypeVar("StructuredModel", bound=BaseModel)
+
+
+_TURN_LLM_TRACE: contextvars.ContextVar[list[dict[str, Any]] | None] = contextvars.ContextVar(
+    "decision_turn_llm_trace",
+    default=None,
+)
+
+_MODEL_PRICING_PER_MILLION: dict[str, tuple[float, float]] = {
+    "openai/gpt-oss-120b": (0.15, 0.60),
+    "openai/gpt-oss-20b": (0.075, 0.30),
+    "qwen/qwen3.8-27b": (0.80, 4.00),
+}
+
+
+def start_llm_turn_trace() -> contextvars.Token:
+    return _TURN_LLM_TRACE.set([])
+
+
+def finish_llm_turn_trace(token: contextvars.Token) -> list[dict[str, Any]]:
+    trace = _TURN_LLM_TRACE.get() or []
+    _TURN_LLM_TRACE.reset(token)
+    return trace
+
+
+def summarize_llm_turn_trace(trace: list[dict[str, Any]]) -> dict[str, Any]:
+    prompt_tokens = sum(int(item.get("prompt_tokens", 0) or 0) for item in trace)
+    completion_tokens = sum(int(item.get("completion_tokens", 0) or 0) for item in trace)
+    total_tokens = sum(int(item.get("total_tokens", 0) or 0) for item in trace)
+    estimated_cost = 0.0
+    for item in trace:
+        value = item.get("estimated_cost_usd")
+        if isinstance(value, (int, float)):
+            estimated_cost += float(value)
+    return {
+        "calls": len([item for item in trace if not item.get("cached")]),
+        "cache_hits": len([item for item in trace if item.get("cached")]),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "estimated_cost_usd": round(estimated_cost, 8),
+        "stage_count": len(trace),
+    }
+
+
+def _append_llm_trace(event: dict[str, Any]) -> None:
+    trace = _TURN_LLM_TRACE.get()
+    if trace is None:
+        return
+    trace.append(event)
+
+
+def _estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) -> float | None:
+    pricing = _MODEL_PRICING_PER_MILLION.get(model)
+    if not pricing:
+        return None
+    input_per_million, output_per_million = pricing
+    return round((prompt_tokens / 1_000_000) * input_per_million + (completion_tokens / 1_000_000) * output_per_million, 8)
+
+
+def _completion_usage(completion: Any) -> tuple[int, int, int]:
+    provider_usage = getattr(completion, "usage", None)
+    prompt_tokens = int(getattr(provider_usage, "prompt_tokens", 0) or 0)
+    completion_tokens = int(getattr(provider_usage, "completion_tokens", 0) or 0)
+    total_tokens = int(getattr(provider_usage, "total_tokens", prompt_tokens + completion_tokens) or 0)
+    return prompt_tokens, completion_tokens, total_tokens
+
+
+def _trace_llm_completion(
+    *,
+    stage: str,
+    requested_model: str,
+    completion: Any,
+    latency_ms: float,
+    cached: bool,
+) -> None:
+    prompt_tokens, completion_tokens, total_tokens = _completion_usage(completion)
+    provider_model = str(getattr(completion, "model", requested_model) or requested_model)
+    estimated_cost = _estimate_cost_usd(provider_model, prompt_tokens, completion_tokens)
+    _append_llm_trace({
+        "stage": stage,
+        "requested_model": requested_model,
+        "provider_model": provider_model,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "latency_ms": round(latency_ms, 2),
+        "estimated_cost_usd": estimated_cost,
+        "cached": cached,
+    })
 
 
 class ExtractionCriterionDraft(BaseModel):
@@ -521,6 +612,18 @@ def _cached_content(brief: dict, key: str, settings: Settings) -> str | None:
     if cached and isinstance(cached.get("content"), str):
         usage = _usage(brief, settings)
         usage["cache_hits"] += 1
+        stage = key.split(":", 1)[0]
+        _append_llm_trace({
+            "stage": stage,
+            "requested_model": str(cached.get("model") or "cached"),
+            "provider_model": str(cached.get("model") or "cached"),
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "latency_ms": 0.0,
+            "estimated_cost_usd": 0.0,
+            "cached": True,
+        })
         return cached["content"]
     return None
 
@@ -535,10 +638,7 @@ def _check_budget(brief: dict, payload: dict, max_tokens: int, settings: Setting
 
 def _record_completion(brief: dict, completion, cache_key: str, content: str, model: str, settings: Settings) -> None:
     usage = _usage(brief, settings)
-    provider_usage = completion.usage
-    prompt_tokens = int(getattr(provider_usage, "prompt_tokens", 0) or 0)
-    completion_tokens = int(getattr(provider_usage, "completion_tokens", 0) or 0)
-    total_tokens = int(getattr(provider_usage, "total_tokens", prompt_tokens + completion_tokens) or 0)
+    prompt_tokens, completion_tokens, total_tokens = _completion_usage(completion)
     usage["prompt_tokens"] += prompt_tokens
     usage["completion_tokens"] += completion_tokens
     usage["total_tokens"] += total_tokens
@@ -582,7 +682,16 @@ async def _complete_structured(
         if model.startswith("openai/gpt-oss-"):
             request_kwargs.setdefault("reasoning_effort", "low")
         try:
+            started = time.perf_counter()
             completion = await client.chat.completions.create(model=model, **request_kwargs)
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            _trace_llm_completion(
+                stage=stage,
+                requested_model=model,
+                completion=completion,
+                latency_ms=elapsed_ms,
+                cached=False,
+            )
             content = completion.choices[0].message.content or "{}"
             return completion, model, parse(json.loads(content)), content
         except RateLimitError as exc:
@@ -616,7 +725,16 @@ async def _complete_structured(
             if model.startswith("openai/gpt-oss-"):
                 repair_kwargs["reasoning_effort"] = "low"
             try:
+                started = time.perf_counter()
                 completion = await client.chat.completions.create(model=model, **repair_kwargs)
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                _trace_llm_completion(
+                    stage=f"{stage}_repair",
+                    requested_model=model,
+                    completion=completion,
+                    latency_ms=elapsed_ms,
+                    cached=False,
+                )
                 content = completion.choices[0].message.content or "{}"
                 parsed = parse(json.loads(content))
                 logger.info("Groq %s JSON repaired successfully with model=%s", stage, model)
