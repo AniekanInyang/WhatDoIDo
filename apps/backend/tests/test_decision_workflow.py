@@ -52,7 +52,6 @@ from app.llm.decision_assistant import (
     _safe_completion_token_limit,
     _short_option_label,
     _strict_response_format,
-    _fallback_clarification_question,
     generate_grounded_recommendation,
     generate_clarification_question,
     _trim_repeated_acknowledgement,
@@ -73,6 +72,18 @@ def stub_question_model(monkeypatch):
         )
 
     monkeypatch.setattr("app.graph.workflow.generate_clarification_question", generate)
+
+
+
+@pytest.fixture
+def stub_recommendation_model(monkeypatch):
+    async def generate(brief, options, settings):
+        return RecommendationResult(
+            selected_option_id=str(options[0]["id"]), selected_option_title=options[0]["title"],
+            summary="A grounded test recommendation based on the supplied priority.",
+            concrete_example=options[0]["title"], rationale=["Matches the stated priority."],
+        )
+    monkeypatch.setattr("app.graph.workflow.generate_grounded_recommendation", generate)
 
 
 def test_duplicate_option_detection_normalizes_and_matches_similar_titles() -> None:
@@ -300,7 +311,7 @@ def test_first_question_keeps_warm_acknowledgement() -> None:
     assert _trim_repeated_acknowledgement(question, is_first_question=True) == question
 
 
-def test_invalid_options_question_falls_back_instead_of_failing(monkeypatch) -> None:
+def test_invalid_options_question_rejects_unusable_response(monkeypatch) -> None:
     async def fake_complete(client, models, **kwargs):
         raw = {
             "question": "Would you rather oatmeal or eggs tomorrow?",
@@ -317,132 +328,89 @@ def test_invalid_options_question_falls_back_instead_of_failing(monkeypatch) -> 
 
     monkeypatch.setattr("app.llm.decision_assistant._complete_structured", fake_complete)
 
-    draft = asyncio.run(generate_clarification_question(
-        ActionPlan(
-            action="ask_clarification",
-            category="options",
-            target_field="options",
-            expected_answer_type="list_of_options",
-            rationale="Need concrete choices",
-        ),
-        {
-            "goal": {"value": "What should I have for breakfast tomorrow?"},
-            "question_history": [{}],
-        },
-        [],
-        "I'd love to use eggs",
-        Settings(_env_file=None, groq_api_key="test-key", llm_stage_delay_seconds=0),
-    ))
-    assert "want me to evaluate" in draft.question.lower()
-    assert draft.target_field == "options"
+    with pytest.raises(ValueError):
+        asyncio.run(generate_clarification_question(
+            ActionPlan(
+                action="ask_clarification",
+                category="options",
+                target_field="options",
+                expected_answer_type="list_of_options",
+                rationale="Need concrete choices",
+            ),
+            {
+                "goal": {"value": "What should I have for breakfast tomorrow?"},
+                "question_history": [{}],
+            },
+            [],
+            "I'd love to use eggs",
+            Settings(_env_file=None, groq_api_key="test-key", llm_stage_delay_seconds=0),
+        ))
 
 
-def test_question_generation_provider_failure_uses_fallback(monkeypatch) -> None:
+def test_question_generation_provider_failure_is_explicit(monkeypatch) -> None:
     async def fail_complete(*args, **kwargs):
         raise DecisionLLMGenerationError("provider unavailable")
 
     monkeypatch.setattr("app.llm.decision_assistant._complete_structured", fail_complete)
 
-    draft = asyncio.run(generate_clarification_question(
-        ActionPlan(
-            action="ask_clarification",
-            category="values",
-            target_field="values",
-            expected_answer_type="short_priority",
-            rationale="Need values",
-        ),
-        {"goal": {"value": "Choose breakfast"}, "question_history": []},
-        [],
-        "eggs",
-        Settings(_env_file=None, groq_api_key="test-key", llm_stage_delay_seconds=0),
-    ))
-    assert "matters most" in draft.question.lower()
-    assert draft.target_field == "values"
+    with pytest.raises(DecisionLLMGenerationError):
+        asyncio.run(generate_clarification_question(
+            ActionPlan(
+                action="ask_clarification",
+                category="values",
+                target_field="values",
+                expected_answer_type="short_priority",
+                rationale="Need values",
+            ),
+            {"goal": {"value": "Choose breakfast"}, "question_history": []},
+            [],
+            "eggs",
+            Settings(_env_file=None, groq_api_key="test-key", llm_stage_delay_seconds=0),
+        ))
 
 
-def test_question_generation_budget_exhaustion_uses_fallback() -> None:
-    draft = asyncio.run(generate_clarification_question(
-        ActionPlan(
-            action="ask_clarification",
-            category="constraints",
-            target_field="constraints",
-            expected_answer_type="short_text",
-            rationale="Need limits",
-        ),
-        {
-            "goal": {"value": "Choose breakfast"},
-            "question_history": [],
-            "llm_usage": {"total_tokens": 5_000, "budget_tokens": 1_000},
-        },
-        [],
-        "eggs",
-        Settings(_env_file=None, groq_api_key="test-key", llm_stage_delay_seconds=0),
-    ))
-    assert "hard limits" in draft.question.lower()
-    assert draft.target_field == "constraints"
+def test_question_generation_budget_exhaustion_is_explicit() -> None:
+    with pytest.raises(DecisionLLMBudgetError):
+        asyncio.run(generate_clarification_question(
+            ActionPlan(
+                action="ask_clarification",
+                category="constraints",
+                target_field="constraints",
+                expected_answer_type="short_text",
+                rationale="Need limits",
+            ),
+            {
+                "goal": {"value": "Choose breakfast"},
+                "question_history": [],
+                "llm_usage": {"total_tokens": 5_000, "budget_tokens": 1_000},
+            },
+            [],
+            "eggs",
+            Settings(_env_file=None, groq_api_key="test-key", llm_stage_delay_seconds=0),
+        ))
 
 
-def test_options_fallback_for_meal_goal_suggests_actionable_candidates() -> None:
-    draft = _fallback_clarification_question(
-        ActionPlan(
-            action="ask_clarification",
-            category="options",
-            target_field="options",
-            expected_answer_type="list_of_options",
-            rationale="Need options",
-        ),
-        {
-            "goal": {"value": "What should I have for breakfast?"},
-            "preference_signals": [{"value": "something healthy"}],
-        },
-    )
-    assert len(draft.suggested_options) == 2
-    assert all(item.specificity == "actionable" for item in draft.suggested_options)
-    assert "want me to evaluate" in draft.question.lower()
-
-
-def test_options_fallback_rejection_reframes_and_avoids_repeat() -> None:
-    draft = _fallback_clarification_question(
-        ActionPlan(
-            action="ask_clarification",
-            category="options",
-            target_field="options",
-            expected_answer_type="list_of_options",
-            rationale="Need options",
-        ),
-        {"goal": {"value": "What should I have for lunch?"}},
-        latest_message="these are not lunch options",
-        forbidden=[
-            "I can compare Chicken and veggie grain bowl vs Salmon salad with avocado and quinoa. Want me to evaluate these now, or do you want to share two specific options of your own?"
-        ],
-    )
-    assert "please share two specific lunch options" in draft.question.lower()
-    assert draft.suggested_options == []
-
-
-def test_recommendation_generation_uses_budget_fallback_without_error() -> None:
-    result = asyncio.run(generate_grounded_recommendation(
-        {
-            "goal": {"value": "Choose lunch", "status": "confirmed"},
-            "values": [{"value": "healthy", "status": "confirmed"}],
-            "constraints": [{"value": "quick prep", "status": "confirmed"}],
-            "llm_usage": {"total_tokens": 9_900, "budget_tokens": 10_000},
-        },
-        [
-            {"id": "opt-1", "title": "Chicken wrap", "status": "confirmed"},
-            {"id": "opt-2", "title": "Veggie bowl", "status": "confirmed"},
-        ],
-        Settings(
-            _env_file=None,
-            groq_api_key="test-key",
-            decision_llm_token_budget=10_000,
-            recommendation_max_tokens=400,
-            llm_stage_delay_seconds=0,
-        ),
-    ))
-    assert result is not None
-    assert result.selected_option_id == "opt-1"
-    assert result.caveat and "budget" in result.caveat.lower()
+def test_recommendation_budget_exhaustion_never_picks_first_option() -> None:
+    with pytest.raises(DecisionLLMBudgetError):
+        asyncio.run(generate_grounded_recommendation(
+            {
+                "goal": {"value": "Choose lunch", "status": "confirmed"},
+                "values": [{"value": "healthy", "status": "confirmed"}],
+                "constraints": [{"value": "quick prep", "status": "confirmed"}],
+                "llm_usage": {"total_tokens": 9_900, "budget_tokens": 10_000},
+            },
+            [
+                {"id": "opt-1", "title": "Chicken wrap", "status": "confirmed"},
+                {"id": "opt-2", "title": "Veggie bowl", "status": "confirmed"},
+            ],
+            Settings(
+                _env_file=None,
+                groq_api_key="test-key",
+                decision_llm_token_budget=10_000,
+                recommendation_max_tokens=400,
+                llm_stage_delay_seconds=0,
+            ),
+        ))
 
 
 def test_appreciation_after_recommendation_gets_short_acknowledgement(monkeypatch) -> None:
@@ -571,7 +539,7 @@ def test_stakes_bound_the_clarification_limit() -> None:
     assert _clarification_limit(DecisionBrief(decision_stakes="high"), 4) == 4
 
 
-def test_low_stakes_turn_limit_stops_discovery_questions() -> None:
+def test_low_stakes_turn_limit_stops_discovery_questions(stub_recommendation_model) -> None:
     graph = build_decision_graph(Settings(
         _env_file=None, groq_api_key=None, decision_max_clarification_turns=8,
     ))
@@ -593,8 +561,8 @@ def test_low_stakes_turn_limit_stops_discovery_questions() -> None:
         ],
         "profile": {},
     }))
-    assert result["selected_action"]["action"] == "evaluate"
-    assert result["selected_action"]["target_field"] == "recommendation_consent"
+    assert result["selected_action"]["action"] == "recommend"
+    assert result["selected_action"]["target_field"] is None
 
 
 def test_confirmation_after_turn_limit_proceeds_despite_missing_details(monkeypatch) -> None:
@@ -1037,7 +1005,7 @@ def test_options_embedded_in_initial_decision_are_captured_immediately() -> None
     assert result["selected_action"]["category"] == "values"
 
 
-def test_meal_conversation_accepts_and_separated_options_and_short_priority() -> None:
+def test_meal_conversation_accepts_and_separated_options_and_short_priority(stub_recommendation_model) -> None:
     graph = build_decision_graph(Settings(_env_file=None, groq_api_key=None))
     first = asyncio.run(graph.ainvoke({
         "decision_id": "meal", "user_id": "user-1",
@@ -1070,8 +1038,8 @@ def test_meal_conversation_accepts_and_separated_options_and_short_priority() ->
         "brief": second["brief"], "existing_options": persisted_options, "profile": {},
     }))
     assert third["brief"]["values"][0]["value"] == "time to cook"
-    assert third["selected_action"]["action"] == "evaluate"
-    assert third["selected_action"]["target_field"] == "recommendation_consent"
+    assert third["selected_action"]["action"] == "recommend"
+    assert third["selected_action"]["target_field"] is None
     assert "recommendation" in third["assistant_reply"].lower()
     assert third["selected_action"]["action"] != "clarify_decision"
 
@@ -1387,7 +1355,7 @@ def test_short_reply_is_resolved_against_pending_semantic_target() -> None:
     assert result["selected_action"]["category"] != "criteria"
 
 
-def test_low_stakes_choice_stops_after_real_options_and_priority() -> None:
+def test_low_stakes_choice_stops_after_real_options_and_priority(stub_recommendation_model) -> None:
     graph = build_decision_graph(Settings(_env_file=None, groq_api_key=None))
     result = asyncio.run(graph.ainvoke({
         "decision_id": "content-choice", "user_id": "user-1",
@@ -1408,7 +1376,7 @@ def test_low_stakes_choice_stops_after_real_options_and_priority() -> None:
     }))
     assert result["brief"]["goal"]["value"] == "What should I post on TikTok?"
     assert result["brief"]["readiness"]["enough_to_recommend"] is True
-    assert result["selected_action"]["action"] == "evaluate"
+    assert result["selected_action"]["action"] == "recommend"
 
 
 def test_clarification_detail_cannot_silently_replace_existing_goal(monkeypatch) -> None:
@@ -1570,7 +1538,7 @@ def test_confirmed_selection_ignores_broad_direction_and_binds_concrete_item() -
         _validate_recommendation_selection(draft, selected)
 
 
-def test_third_criteria_attempt_can_confirm_existing_values_without_repeating() -> None:
+def test_third_criteria_attempt_can_confirm_existing_values_without_repeating(stub_recommendation_model) -> None:
     graph = build_decision_graph(Settings(_env_file=None, groq_api_key=None))
     result = asyncio.run(graph.ainvoke({
         "decision_id": "decision-food", "user_id": "user-1",
@@ -1593,7 +1561,7 @@ def test_third_criteria_attempt_can_confirm_existing_values_without_repeating() 
     }))
     assert result["brief"]["criteria"][0]["name"] == "nutrition"
     assert result["brief"]["criteria"][0]["status"] == "confirmed"
-    assert result["selected_action"]["category"] == "evaluation"
+    assert result["selected_action"]["category"] == "recommendation"
 
 
 def test_recommend_now_infers_options_and_recommends_without_more_questions(monkeypatch) -> None:
@@ -1718,3 +1686,79 @@ def test_retry_workflow_replays_saved_revision_feedback(monkeypatch) -> None:
     message = asyncio.run(store.retry_workflow(decision_id))
     assert message.content == "revised"
     assert calls["content"] == "this feels too formal for casual dinner"
+
+
+def test_message_id_replay_returns_saved_turn_without_writing(monkeypatch):
+    from app.models.decision import DecisionMessageCreate, DecisionDetail
+    user_id, decision_id, message_id = uuid4(), uuid4(), uuid4()
+    now = "2026-11-09T00:00:00Z"
+    detail = DecisionDetail.model_validate({
+        "id": str(decision_id), "title": "Training", "prompt": "Choose training", "status": "exploring",
+        "created_at": now, "updated_at": now, "decision_brief": {},
+        "messages": [
+            {"id": str(message_id), "decision_id": str(decision_id), "role": "user", "content": "My budget is $400",
+             "structured_data": {}, "created_at": now},
+            {"id": str(uuid4()), "decision_id": str(decision_id), "role": "assistant", "content": "How much time do you have?",
+             "structured_data": {"in_reply_to": str(message_id)}, "created_at": now},
+        ],
+    })
+    store = DecisionStore(Settings(_env_file=None, supabase_url="https://example.test", supabase_anon_key="key"),
+                          AuthenticatedUser(id=user_id, access_token="token"))
+    async def get(_):
+        return detail
+    async def no_write(*args, **kwargs):
+        pytest.fail("Replaying an accepted message must not write or invoke the model")
+    monkeypatch.setattr(store, "get", get)
+    monkeypatch.setattr(store, "_request", no_write)
+    result = asyncio.run(store.add_message(decision_id, DecisionMessageCreate(id=message_id, content="My budget is $400")))
+    assert result.user_message.id == message_id
+    assert result.assistant_message.content == "How much time do you have?"
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as conflict:
+        asyncio.run(store.add_message(decision_id, DecisionMessageCreate(id=message_id, content="Different facts")))
+    assert conflict.value.status_code == 409
+    detail.messages.pop()
+    with pytest.raises(HTTPException) as pending:
+        asyncio.run(store.add_message(decision_id, DecisionMessageCreate(id=message_id, content="My budget is $400")))
+    assert pending.value.status_code == 409
+
+
+def test_question_semantic_validation_repairs_with_original_context():
+    from app.llm.decision_assistant import QuestionResponseDraft
+    calls = []
+    class Completions:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            question = "What matters most?" if len(calls) == 1 else "Is the $400 cap inclusive of course materials?"
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "question": question, "acknowledges_answer": True, "suggested_options": []
+            })))])
+    def parse(raw):
+        if raw["question"] == "What matters most?":
+            raise ValueError("Already answered priorities; ask about the materials budget")
+        return QuestionResponseDraft.model_validate(raw)
+    _, _, draft, _ = asyncio.run(_complete_structured(
+        SimpleNamespace(chat=SimpleNamespace(completions=Completions())), ["primary", "secondary"],
+        stage="question", schema_name="clarification_question", response_model=QuestionResponseDraft,
+        parse=parse, messages=[{"role": "user", "content": "I have $400 and prioritize hands-on practice"}],
+        max_completion_tokens=300,
+    ))
+    assert "materials" in draft.question
+    assert len(calls) == 2
+    assert "I have $400" in json.dumps(calls[1]["messages"])
+    assert "Already answered" in json.dumps(calls[1]["messages"])
+
+
+def test_failed_attempt_telemetry_is_retained_at_same_revision(monkeypatch):
+    store = DecisionStore(Settings(_env_file=None, supabase_url="https://example.test", supabase_anon_key="key"),
+                          AuthenticatedUser(id=uuid4(), access_token="token"))
+    original = {"message_id": "first", "stages": [{"stage": "extraction"}]}
+    new = {"message_id": "second", "stages": [{"stage": "question", "error_type": "RateLimitError"}]}
+    calls = []
+    async def request(client, method, path, **kwargs):
+        calls.append((method, kwargs))
+        return [{"id": "event", "payload": original}] if method == "GET" else []
+    monkeypatch.setattr(store, "_request", request)
+    asyncio.run(store._record_state_event(None, uuid4(), "llm_turn_metrics", 0, new))
+    assert calls[1][0] == "PATCH"
+    assert calls[1][1]["json"]["payload"]["attempts"] == [original, new]

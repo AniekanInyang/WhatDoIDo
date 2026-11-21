@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from difflib import SequenceMatcher
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
 from langgraph.graph import END, START, StateGraph
 
@@ -101,6 +102,14 @@ def _actionable_options(options: list[dict[str, Any]]) -> list[dict[str, Any]]:
         option for option in options
         if option.get("status") != "rejected" and _option_specificity(option) == "actionable"
     ]
+
+
+def _identify_new_option(option: dict[str, Any], state: GraphState) -> dict[str, Any]:
+    """Give a pending alternative a stable identity until the store persists it."""
+    if option.get("id"):
+        return option
+    identity = f"{state.get('decision_id', '')}:{state.get('message_id', '')}:{_normalized(str(option['title']))}"
+    return {**option, "id": f"provisional-{uuid5(NAMESPACE_URL, identity)}", "status": option.get("status", "candidate")}
 
 
 def _selected_direction(brief: DecisionBrief, options: list[dict[str, Any]]) -> str | None:
@@ -434,7 +443,7 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
                     )
                     brief.preference_signals = _merge_facts(brief.preference_signals, [selection])
             else:
-                accepted.append(candidate)
+                accepted.append(_identify_new_option(candidate, state))
                 all_titles.append(candidate["title"])
 
         all_options = [*existing, *accepted]
@@ -471,6 +480,7 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
         brief.missing_information = gaps
         return {
             "brief": brief.model_dump(mode="json"),
+            "existing_options": existing,
             "new_options": accepted,
             "duplicate_options": duplicates,
             "direction_changed": direction_changed,
@@ -583,9 +593,8 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
                 )
             elif brief.readiness.enough_to_recommend:
                 action = ActionPlan(
-                    action="evaluate", category="evaluation", target_field="recommendation_consent",
-                    expected_answer_type="recommend_or_correct",
-                    rationale="The core goal, options, criteria, values, and constraints are present.", utility=1,
+                    action="recommend", category="recommendation",
+                    rationale="The core context is present; provide the recommendation with any remaining caveats.", utility=1,
                 )
             elif (
                 _clarification_count(brief)
@@ -594,9 +603,8 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
                 and not _rejects_current_suggested_options(state["user_message"])
             ):
                 action = ActionPlan(
-                    action="evaluate", category="evaluation", target_field="recommendation_consent",
-                    expected_answer_type="recommend_or_correct",
-                    rationale="The clarification-turn budget is exhausted; offer an appropriately caveated evaluation.",
+                    action="recommend", category="recommendation",
+                    rationale="The clarification-turn budget is exhausted; provide an appropriately caveated recommendation.",
                     utility=1,
                 )
             else:
@@ -687,12 +695,20 @@ def build_decision_graph(settings: Settings, *, checkpointer=None):
         }
 
     async def evaluate_options(state: GraphState) -> dict[str, Any]:
-        """Decision engine: compare persisted options against the typed brief."""
-        options = _actionable_options(state.get("existing_options", []))
+        """Compare saved and newly observed alternatives using stable identities."""
+        pending = [_identify_new_option(option, state) for option in state.get("new_options", [])]
+        combined = [*state.get("existing_options", []), *pending]
+        if any(not option.get("id") for option in combined):
+            raise RecommendationGenerationError("An existing option is missing its saved identifier")
+        # Inference can place pending options in both collections. Evaluate each
+        # once, keeping the same IDs in critique and the persistence payload.
+        combined = list({str(option["id"]): option for option in combined}.values())
+        options = _actionable_options(combined)
         result = await generate_grounded_recommendation(state["brief"], options, settings)
         if not result:
             raise RecommendationGenerationError("The provider returned no valid grounded recommendation")
-        return {"recommendation": result.model_dump(mode="json"), "brief": state["brief"]}
+        return {"recommendation": result.model_dump(mode="json"), "brief": state["brief"],
+                "existing_options": combined, "new_options": pending}
 
     async def infer_options_for_immediate_recommendation(state: GraphState) -> dict[str, Any]:
         """Create provisional concrete choices instead of forcing more questions."""

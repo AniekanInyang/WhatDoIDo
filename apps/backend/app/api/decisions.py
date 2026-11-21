@@ -1,7 +1,7 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Query, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 
 from app.core.auth import CurrentUser
 from app.core.config import Settings, get_settings
@@ -36,6 +36,16 @@ async def create_decision(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> DecisionSummary:
     store = DecisionStore(settings, user)
+    if values.id:
+        try:
+            existing = await store.get(values.id)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+        else:
+            if existing.prompt != values.prompt:
+                raise HTTPException(status_code=409, detail="Decision ID already used for different content")
+            return DecisionSummary.model_validate(existing.model_dump())
     decision, user_message = await store.create_pending(values)
     background_tasks.add_task(store.process_initial_turn, decision.id, user_message)
     return decision
@@ -209,3 +219,12 @@ async def permanently_delete_decision(
 ) -> Response:
     await DecisionStore(settings, user).permanently_delete(decision_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/{decision_id}/events")
+async def get_decision_events(
+    decision_id: UUID,
+    user: CurrentUser,
+    settings: Annotated[Settings, Depends(get_settings)],
+) -> list[dict]:
+    return await DecisionStore(settings, user).get_events(decision_id)

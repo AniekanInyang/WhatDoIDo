@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 
 class DecisionCreate(BaseModel):
+    id: UUID | None = None
     prompt: str = Field(min_length=1, max_length=10_000)
 
 
@@ -58,6 +59,7 @@ class DecisionMessage(BaseModel):
 
 
 class DecisionMessageCreate(BaseModel):
+    id: UUID | None = None
     content: str = Field(min_length=1, max_length=50_000)
 
 

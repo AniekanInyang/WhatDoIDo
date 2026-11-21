@@ -146,6 +146,7 @@ class DecisionStore:
                 "POST",
                 "decisions",
                 json={
+                    **({"id": str(values.id)} if values.id else {}),
                     "user_id": str(self.user.id),
                     "title": title,
                     "prompt": values.prompt,
@@ -261,12 +262,14 @@ class DecisionStore:
         *,
         trusted_backend: bool,
         structured_data: dict[str, Any] | None = None,
+        message_id: UUID | None = None,
     ) -> DecisionMessage:
         rows = await self._request(
             client,
             "POST",
             "decision_messages",
             json={
+                **({"id": str(message_id)} if message_id else {}),
                 "decision_id": str(decision_id),
                 "role": role,
                 "content": content,
@@ -281,6 +284,18 @@ class DecisionStore:
         self, decision_id: UUID, values: DecisionMessageCreate
     ) -> ConversationTurn:
         decision = await self.get(decision_id)
+        if values.id:
+            for index, message in enumerate(decision.messages):
+                if message.id != values.id:
+                    continue
+                if message.role != "user" or message.content != values.content:
+                    raise HTTPException(status_code=409, detail="Message ID already used for different content")
+                for reply in decision.messages[index + 1:]:
+                    if reply.role == "user":
+                        break
+                    if reply.role == "assistant":
+                        return ConversationTurn(user_message=message, assistant_message=reply)
+                raise HTTPException(status_code=409, detail="Message already accepted; reconcile decision state before retrying")
         if decision.status == "completed":
             raise HTTPException(
                 status_code=409,
@@ -288,7 +303,7 @@ class DecisionStore:
             )
         async with httpx.AsyncClient(timeout=10.0) as client:
             user_message = await self._insert_message(
-                client, decision_id, "user", values.content, trusted_backend=False
+                client, decision_id, "user", values.content, trusted_backend=False, message_id=values.id
             )
             if decision.recommendation:
                 trace_token = start_llm_turn_trace()
@@ -728,6 +743,7 @@ class DecisionStore:
                     "workflow_error": "rate_limited",
                     "retry_available": True,
                     "llm_metrics": summarize_llm_turn_trace(trace),
+                    "stages": trace,
                 },
             )
         except DecisionLLMBudgetError:
@@ -755,6 +771,7 @@ class DecisionStore:
                     "workflow_error": "budget_exhausted",
                     "retry_available": False,
                     "llm_metrics": summarize_llm_turn_trace(trace),
+                    "stages": trace,
                 },
             )
         except DecisionLLMGenerationError:
@@ -782,16 +799,17 @@ class DecisionStore:
                     "workflow_error": "question_unavailable",
                     "retry_available": True,
                     "llm_metrics": summarize_llm_turn_trace(trace),
+                    "stages": trace,
                 },
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Decision workflow failed for decision %s at the initial conversation turn",
                 decision_id,
             )
             await self._record_state_event(
                 client, decision_id, "workflow_failed", int(brief.get("revision", 0)),
-                {"message_id": str(user_message.id), "retryable": True},
+                {"message_id": str(user_message.id), "retryable": True, "error_type": type(exc).__name__},
             )
             trace = finish_llm_turn_trace(trace_token)
             await self._record_state_event(
@@ -813,6 +831,7 @@ class DecisionStore:
                     "workflow_error": "retryable",
                     "retry_available": True,
                     "llm_metrics": summarize_llm_turn_trace(trace),
+                    "stages": trace,
                 },
             )
         trace = finish_llm_turn_trace(trace_token)
@@ -963,30 +982,44 @@ class DecisionStore:
                 "recommendation_error": "",
             }
             trace_token = start_llm_turn_trace()
+
+            async def record_retry_failure(exc: Exception) -> None:
+                trace = finish_llm_turn_trace(trace_token)
+                try:
+                    await self._record_state_event(
+                        client, decision_id, "llm_turn_metrics",
+                        int(decision.decision_brief.get("revision", 0)),
+                        {"message_id": str(user_message.id), "retry": True,
+                         "error_type": type(exc).__name__, "stages": trace,
+                         "summary": summarize_llm_turn_trace(trace)},
+                    )
+                except Exception:
+                    logger.exception("Could not persist failed retry telemetry for %s", decision_id)
+
             try:
                 # A retry starts from persisted application state instead of replaying
                 # a stale failed task from a checkpoint created by older code.
                 result = await self._invoke_graph(decision_id, payload, fresh=True)
             except DecisionLLMRateLimitError as exc:
-                finish_llm_turn_trace(trace_token)
+                await record_retry_failure(exc)
                 raise HTTPException(
                     status_code=429,
                     detail="The AI service usage limit is still active. Please retry later.",
                 ) from exc
             except DecisionLLMBudgetError as exc:
-                finish_llm_turn_trace(trace_token)
+                await record_retry_failure(exc)
                 raise HTTPException(
                     status_code=409,
                     detail="This decision has reached its AI usage budget.",
                 ) from exc
             except DecisionLLMGenerationError as exc:
-                finish_llm_turn_trace(trace_token)
+                await record_retry_failure(exc)
                 raise HTTPException(
                     status_code=503,
                     detail="Question generation is temporarily unavailable. Please retry later.",
                 ) from exc
             except Exception as exc:
-                finish_llm_turn_trace(trace_token)
+                await record_retry_failure(exc)
                 logger.exception("Fresh workflow retry failed for decision %s", decision_id)
                 raise HTTPException(status_code=503, detail="The workflow could not be retried") from exc
             trace = finish_llm_turn_trace(trace_token)
@@ -1201,6 +1234,7 @@ class DecisionStore:
                 "duplicate_options": result.get("duplicate_options", []),
                 "state_revision": updated_brief["revision"],
                 "workflow_error": result.get("recommendation_error"),
+                "in_reply_to": str(user_message.id),
                 "llm_metrics": llm_turn_summary or {},
             },
         )
@@ -1243,6 +1277,16 @@ class DecisionStore:
                 trusted_backend=True,
             )
 
+    async def get_events(self, decision_id: UUID) -> list[dict[str, Any]]:
+        await self.get(decision_id)  # Enforce ownership before trusted telemetry access.
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            return await self._request(
+                client, "GET", "decision_state_events",
+                params={"decision_id": f"eq.{decision_id}", "user_id": f"eq.{self.user.id}",
+                        "select": "*", "order": "created_at.asc"},
+                trusted_backend=True,
+            )
+
     async def _record_state_event(
         self,
         client: httpx.AsyncClient,
@@ -1259,12 +1303,26 @@ class DecisionStore:
                 "decision_id": f"eq.{decision_id}",
                 "revision": f"eq.{revision}",
                 "event_type": f"eq.{event_type}",
-                "select": "id",
+                "select": "id,payload",
                 "limit": "1",
             },
             trusted_backend=True,
         )
         if existing:
+            # Failure and retry attempts can share a revision. Keep every trace
+            # instead of silently dropping subsequent messages at that revision.
+            if event_type in {"llm_turn_metrics", "workflow_failed", "workflow_rate_limited",
+                              "workflow_budget_exhausted", "question_generation_unavailable"}:
+                previous = dict(existing[0].get("payload") or {})
+                attempts = previous.pop("attempts", [])
+                if not attempts:
+                    attempts = [previous]
+                await self._request(
+                    client, "PATCH", "decision_state_events",
+                    params={"id": f"eq.{existing[0]['id']}"},
+                    json={"payload": {**payload, "attempts": [*attempts, payload]}},
+                    trusted_backend=True,
+                )
             return
         await self._request(
             client,

@@ -118,7 +118,7 @@ def _trace_llm_completion(
 
 
 class ExtractionCriterionDraft(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=200)
     importance: int = Field(default=3, ge=1, le=5)
 
 
@@ -298,6 +298,10 @@ def _provider_error_details(exc: Exception) -> tuple[int | None, str | None, str
 
 def _log_provider_error(model: str, exc: Exception, *, stage: str) -> None:
     status, code, message, headers = _provider_error_details(exc)
+    trace = _TURN_LLM_TRACE.get()
+    if trace is not None:
+        trace.append({"stage": stage, "requested_model": model, "error_type": type(exc).__name__,
+                      "status_code": status, "provider_code": code, "rate_headers": headers})
     logger.warning(
         "Groq %s request failed model=%s status=%s code=%s message=%s rate_headers=%s",
         stage, model, status, code, message, headers,
@@ -681,6 +685,7 @@ async def _complete_structured(
         request_kwargs["response_format"] = _strict_response_format(schema_name, response_model)
         if model.startswith("openai/gpt-oss-"):
             request_kwargs.setdefault("reasoning_effort", "low")
+        content = None
         try:
             started = time.perf_counter()
             completion = await client.chat.completions.create(model=model, **request_kwargs)
@@ -708,7 +713,7 @@ async def _complete_structured(
                 # the same constrained model and often burns extra OTPM. Move
                 # to the next configured model immediately.
                 continue
-            failed = _failed_generation(exc) if _is_json_validation_failure(exc) else None
+            failed = _failed_generation(exc) if _is_json_validation_failure(exc) else content if isinstance(exc, (ValueError, TypeError)) else None
             if repair_used or not failed:
                 continue
             repair_used = True
@@ -717,7 +722,9 @@ async def _complete_structured(
             if model.startswith("qwen/"):
                 repair_limit = min(repair_limit, 260)
             repair_kwargs = {
-                "messages": _repair_messages(schema_name, failed, response_model),
+                "messages": (_repair_messages(schema_name, failed, response_model) if _is_json_validation_failure(exc) else [*kwargs.get("messages", []),
+                             {"role": "assistant", "content": failed[:4000]},
+                             {"role": "user", "content": "Repair this response. Validation failed: " + str(exc)[:1000] + ". Return only a valid JSON object satisfying the original task and schema."}]),
                 "temperature": 0,
                 "response_format": {"type": "json_object"},
                 "max_completion_tokens": repair_limit,
@@ -891,9 +898,10 @@ def _merge_contextual_answer(
     if category == "criteria" and importance_match and not patch.criteria:
         importance = int(importance_match.group(1))
         for value in current_brief.get("values", []):
-            if value.get("status") not in {"rejected", "superseded"}:
+            name = str(value.get("value") or "").strip()
+            if value.get("status") not in {"rejected", "superseded"} and 0 < len(name) <= 200:
                 patch.criteria.append(Criterion(
-                    name=str(value.get("value")), importance=importance, source="explicit",
+                    name=name, importance=importance, source="explicit",
                     confidence="high", status="confirmed", evidence_message_ids=[message_id],
                 ))
         if patch.criteria:
@@ -907,9 +915,10 @@ def _merge_contextual_answer(
         and not patch.criteria
     ):
         for value in current_brief.get("values", []):
-            if value.get("status") not in {"rejected", "superseded"}:
+            name = str(value.get("value") or "").strip()
+            if value.get("status") not in {"rejected", "superseded"} and 0 < len(name) <= 200:
                 patch.criteria.append(Criterion(
-                    name=str(value.get("value")), importance=3, source="confirmed",
+                    name=name, importance=3, source="confirmed",
                     confidence="high", status="confirmed", evidence_message_ids=[message_id],
                 ))
         if patch.criteria:
@@ -922,6 +931,16 @@ def _merge_contextual_answer(
                 evidence_message_ids=[message_id])
     if category == "values":
         values = _split_compound_values(message)
+        if not values or any(len(value) > 200 or len(value.split()) > 6 for value in values):
+            # This helper only interprets terse labels. Full explanations must
+            # retain the model's semantic extraction, not become criterion names
+            # or overwrite its weights. Preserve the raw answer when extraction
+            # is unavailable as well, without truncating or inventing labels.
+            if not any(item.value == fact.value for item in patch.preference_signals):
+                patch.preference_signals.append(fact)
+            patch.is_decision_input = True
+            patch.non_decision_reason = None
+            return patch
         combined = " ".join(message.lower().split())
         normalized_values = {" ".join(value.lower().split()) for value in values}
         if len(values) > 1 or combined not in normalized_values:
@@ -993,8 +1012,9 @@ supplies a format, channel, attribute, example, preference, constraint, or optio
 Classify decision_stakes from consequence and reversibility: low for readily
 reversible choices with minor consequences, medium for meaningful but manageable
 tradeoffs, and high for serious financial, health, safety, legal, career, or
-relationship consequences. Criteria have only name and importance from 1 to 5;
-use 3 when unspecified. Assumptions are unconfirmed claims required to reason.
+relationship consequences. Criteria have only a concise name (at most 200 characters) and importance from 1 to 5;
+extract the criterion label, never copy a whole explanatory paragraph into name.
+Use 3 when unspecified. Assumptions are unconfirmed claims required to reason.
 Risks contain title, description, severity, likelihood, and optional mitigation.
 Each option has title, optional description, kind=alternative or context, and
 specificity=direction or actionable. An alternative
@@ -1176,13 +1196,16 @@ async def extract_decision_patch(
     key = _cache_key("extraction", payload)
     cached = _cached_content(current_brief, key, settings)
     if cached:
-        draft = ExtractionDraft.model_validate_json(cached)
-        draft = _bind_selected_option(draft, current_options or [])
-        parsed = _extraction_patch_from_draft(draft, message_id)
-        parsed = _preserve_opening_decision(parsed, fallback, current_brief)
-        if not draft.selected_option_title:
-            parsed = _merge_explicit_options(parsed, message, current_brief)
-        return _merge_contextual_answer(parsed, message, message_id, current_brief)
+        try:
+            draft = ExtractionDraft.model_validate_json(cached)
+            draft = _bind_selected_option(draft, current_options or [])
+            parsed = _extraction_patch_from_draft(draft, message_id)
+            parsed = _preserve_opening_decision(parsed, fallback, current_brief)
+            if not draft.selected_option_title:
+                parsed = _merge_explicit_options(parsed, message, current_brief)
+            return _merge_contextual_answer(parsed, message, message_id, current_brief)
+        except (ValueError, TypeError):
+            logger.warning("Ignoring invalid cached extraction")
     try:
         _check_budget(current_brief, payload, settings.extraction_max_tokens, settings)
         client = AsyncGroq(
@@ -1379,155 +1402,6 @@ def _lexical_similarity(left: str, right: str) -> float:
     return overlap / max(1, min(len(left_tokens), len(right_tokens)))
 
 
-def _message_rejects_previous_suggestions(message: str) -> bool:
-    normalized = _normalized_sentence(message)
-    if not normalized:
-        return False
-    rejection_patterns = (
-        "these are not",
-        "those are not",
-        "not lunch",
-        "not breakfast",
-        "not dinner",
-        "wrong options",
-        "different options",
-        "other options",
-    )
-    return any(pattern in normalized for pattern in rejection_patterns)
-
-
-def _meal_type_from_context(goal_text: str, latest_message: str) -> str | None:
-    context = f"{goal_text} {latest_message}".lower()
-    if "lunch" in context:
-        return "lunch"
-    if "dinner" in context:
-        return "dinner"
-    if "breakfast" in context:
-        return "breakfast"
-    if any(term in context for term in ("meal", "eat", "cook", "food")):
-        return "meal"
-    return None
-
-
-def _fallback_clarification_question(
-    action: ActionPlan,
-    brief: dict,
-    *,
-    latest_message: str = "",
-    forbidden: list[str | None] | None = None,
-) -> QuestionDraft:
-    """Return a safe deterministic question when model output is invalid."""
-    target = action.target_field or action.category
-    goal_text = ""
-    goal = brief.get("goal")
-    if isinstance(goal, dict):
-        goal_text = str(goal.get("value") or "").strip()
-    forbidden_normalized = {
-        _normalized_sentence(str(item))
-        for item in (forbidden or [])
-        if item
-    }
-
-    def fallback_meal_suggestions(meal_type: str | None) -> list[OptionObservation]:
-        preference_text = " ".join(
-            str(item.get("value") or "")
-            for item in brief.get("preference_signals", [])
-            if isinstance(item, dict)
-        ).lower()
-        if meal_type == "lunch":
-            candidates = [
-                "Chicken and veggie grain bowl",
-                "Salmon salad with avocado and quinoa",
-            ]
-        elif meal_type == "dinner":
-            candidates = [
-                "Baked salmon with roasted vegetables",
-                "Turkey chili with mixed beans",
-            ]
-        elif "egg" in preference_text:
-            candidates = [
-                "Scrambled eggs with spinach",
-                "Egg-and-avocado whole-grain toast",
-            ]
-        elif "healthy" in preference_text:
-            candidates = [
-                "Oatmeal with berries and nuts",
-                "Veggie omelet with whole-grain toast",
-            ]
-        else:
-            candidates = [
-                "Greek yogurt bowl with fruit",
-                "Peanut-butter banana whole-grain toast",
-            ]
-        return [
-            OptionObservation(
-                title=title,
-                description=None,
-                source="ai_generated",
-                kind="alternative",
-                specificity="actionable",
-            )
-            for title in candidates
-        ]
-
-    suggested_options: list[OptionObservation] = []
-    if target in {"options", "concrete_options"}:
-        meal_type = _meal_type_from_context(goal_text, latest_message)
-        if _message_rejects_previous_suggestions(latest_message):
-            meal_label = f" {meal_type}" if meal_type in {"breakfast", "lunch", "dinner"} else ""
-            question = (
-                "Understood. Please share two specific"
-                f"{meal_label} options you would actually choose between, and I will compare them directly."
-            )
-        elif meal_type:
-            suggested_options = fallback_meal_suggestions(meal_type)
-            left, right = suggested_options[0].title, suggested_options[1].title
-            question = (
-                f"I can compare {left} vs {right}. Want me to evaluate these now, "
-                "or do you want to share two specific options of your own?"
-            )
-        elif goal_text:
-            question = (
-                f"To decide \"{goal_text}\", what are two specific options you want compared?"
-            )
-        else:
-            question = "What are two specific options you want compared?"
-    elif target == "criterion_importance":
-        question = "How important is each of the factors you already named, on a 1-5 scale?"
-    elif target == "constraints":
-        question = "What hard limits should any good option respect?"
-    elif target == "uncertainties":
-        question = "What unknowns could still change your choice?"
-    elif target == "values":
-        question = "What matters most to you for this decision right now?"
-    elif target == "risk_tolerance":
-        question = "How much downside risk are you comfortable with for this choice?"
-    elif target == "decision_context":
-        question = "What one detail about your situation would most change this decision?"
-    elif target == "recommendation_consent":
-        question = "I have enough context for a provisional recommendation. Do you want it now?"
-    else:
-        question = "What single detail would most help narrow this decision?"
-
-    if (
-        _normalized_sentence(question) in forbidden_normalized
-        or any(_lexical_similarity(question, item) >= 0.9 for item in forbidden_normalized)
-    ):
-        if target in {"options", "concrete_options"}:
-            question = "Please share two concrete options you actually want compared right now."
-            suggested_options = []
-        else:
-            question = "Could you share one new detail that would help narrow the decision?"
-
-    return QuestionDraft(
-        question=question,
-        target_field=target,
-        expected_answer_type=action.expected_answer_type or "short_text",
-        acknowledges_answer=False,
-        suggested_options=[item.model_dump(mode="json") for item in suggested_options],
-    )
-
-
 async def generate_clarification_question(
     action: ActionPlan,
     brief: dict,
@@ -1577,17 +1451,7 @@ async def generate_clarification_question(
         )
         validation_errors = _question_validation_errors(draft, forbidden)
         if validation_errors:
-            logger.warning(
-                "Question validation failed for target=%s: %s; using deterministic fallback",
-                draft.target_field,
-                "; ".join(validation_errors),
-            )
-            return _fallback_clarification_question(
-                action,
-                brief,
-                latest_message=latest_message,
-                forbidden=forbidden,
-            )
+            raise ValueError("Question validation failed: " + "; ".join(validation_errors))
         return draft
 
     if cached:
@@ -1596,31 +1460,23 @@ async def generate_clarification_question(
         except Exception:
             logger.warning("Ignoring invalid cached clarification question")
 
-    try:
-        _check_budget(brief, payload, settings.question_max_tokens, settings)
-        await asyncio.sleep(settings.llm_stage_delay_seconds)
-        completion, model, draft, content = await _complete_structured(
-            client, [settings.groq_light_model, settings.groq_light_fallback_model],
-            stage="question",
-            schema_name="clarification_question",
-            response_model=QuestionResponseDraft,
-            parse=parse_question,
-            messages=[
-                {"role": "system", "content": QUESTION_PROMPT},
-                {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
-            ],
-            temperature=0.35,
-            max_completion_tokens=settings.question_max_tokens,
-        )
-        _record_completion(brief, completion, key, content, model, settings)
-        return draft
-    except (DecisionLLMRateLimitError, DecisionLLMBudgetError, DecisionLLMGenerationError):
-        return _fallback_clarification_question(
-            action,
-            brief,
-            latest_message=latest_message,
-            forbidden=forbidden,
-        )
+    _check_budget(brief, payload, settings.question_max_tokens, settings)
+    await asyncio.sleep(settings.llm_stage_delay_seconds)
+    completion, model, draft, content = await _complete_structured(
+        client, [settings.groq_light_model, settings.groq_light_fallback_model],
+        stage="question",
+        schema_name="clarification_question",
+        response_model=QuestionResponseDraft,
+        parse=parse_question,
+        messages=[
+            {"role": "system", "content": QUESTION_PROMPT},
+            {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
+        ],
+        temperature=0.35,
+        max_completion_tokens=settings.question_max_tokens,
+    )
+    _record_completion(brief, completion, key, content, model, settings)
+    return draft
 
 
 IMMEDIATE_OPTIONS_PROMPT = """Infer two or three concrete, mutually exclusive
@@ -1636,77 +1492,6 @@ an existing option. Return JSON only with an options array. Every option must
 include a concise title, an optional description, and specificity="actionable"."""
 
 
-def _fallback_immediate_options(
-    brief: dict,
-    options: list[dict],
-) -> list[OptionObservation]:
-    """Deterministic fallback for assistive mode when provider calls fail.
-
-    Uses lightweight domain cues so users who do not know specific options can
-    still receive concrete alternatives instead of another dead-end prompt.
-    """
-    existing_titles = {
-        " ".join(str(option.get("title", "")).lower().split())
-        for option in options if option.get("status") != "rejected"
-    }
-    goal_text = ""
-    goal = brief.get("goal") or {}
-    if isinstance(goal, dict):
-        goal_text = str(goal.get("value") or "").lower()
-    preference_text = " ".join(
-        str(item.get("value") or "")
-        for item in brief.get("preference_signals", [])
-        if isinstance(item, dict) and item.get("status") != "rejected"
-    ).lower()
-    value_text = " ".join(
-        str(item.get("value") or "")
-        for item in brief.get("values", [])
-        if isinstance(item, dict) and item.get("status") != "rejected"
-    ).lower()
-    context = f"{goal_text} {preference_text} {value_text}"
-
-    if "music" in context or "song" in context or "audio" in context:
-        if any(term in context for term in ("romantic", "calm", "soft", "gentle")):
-            candidates = [
-                ("Romantic piano instrumental", "Soft piano with warm ambient strings"),
-                ("Calm lo-fi groove", "Low-tempo lo-fi beat with mellow chords"),
-            ]
-        elif any(term in context for term in ("energetic", "hype", "fast", "upbeat")):
-            candidates = [
-                ("Upbeat pop instrumental", "Bright tempo with rhythmic hooks"),
-                ("Energetic electronic beat", "Driving percussion and bold synth layers"),
-            ]
-        else:
-            candidates = [
-                ("Cinematic ambient track", "Atmospheric score for emotional storytelling"),
-                ("Minimal acoustic instrumental", "Clean guitar-led bed with light rhythm"),
-            ]
-    elif any(term in context for term in ("breakfast", "lunch", "dinner", "meal", "eat", "cook")):
-        candidates = [
-            ("Chicken and veggie grain bowl", "Balanced bowl with lean protein and vegetables"),
-            ("Salmon salad with avocado", "Light salad with healthy fats and protein"),
-        ]
-    else:
-        candidates = [
-            ("Conservative practical choice", "Safer option prioritizing reliability and low downside"),
-            ("Higher-upside experimental choice", "Bolder option prioritizing potential upside"),
-        ]
-
-    inferred: list[OptionObservation] = []
-    for title, description in candidates:
-        normalized = " ".join(title.lower().split())
-        if normalized in existing_titles:
-            continue
-        inferred.append(OptionObservation(
-            title=title,
-            description=description,
-            source="ai_generated",
-            kind="alternative",
-            specificity="actionable",
-        ))
-    return inferred[:3]
-
-
 async def generate_immediate_options(
     brief: dict,
     options: list[dict],
@@ -1714,7 +1499,7 @@ async def generate_immediate_options(
 ) -> list[OptionObservation]:
     """Infer provisional choices so an explicit recommend-now request can proceed."""
     if not settings.groq_api_key:
-        return _fallback_immediate_options(brief, options)
+        raise DecisionLLMGenerationError("Option generation requires an AI provider")
     payload = {
         "decision_brief": _compact_brief(brief),
         "existing_options": _compact_options(options),
@@ -1752,29 +1537,26 @@ async def generate_immediate_options(
         except Exception:
             logger.warning("Ignoring invalid cached immediate option set")
 
-    try:
-        _check_budget(brief, payload, settings.question_max_tokens, settings)
-        client = AsyncGroq(
-            api_key=settings.groq_api_key.get_secret_value(), timeout=20.0, max_retries=0
-        )
-        await asyncio.sleep(settings.llm_stage_delay_seconds)
-        completion, model, inferred, content = await _complete_structured(
-            client, [settings.groq_light_model, settings.groq_light_fallback_model],
-            stage="immediate_options",
-            schema_name="immediate_decision_options",
-            response_model=ImmediateOptionSetDraft,
-            parse=parse_options,
-            messages=[
-                {"role": "system", "content": IMMEDIATE_OPTIONS_PROMPT},
-                {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
-            ],
-            temperature=0.25,
-            max_completion_tokens=settings.question_max_tokens,
-        )
-        _record_completion(brief, completion, key, content, model, settings)
-        return inferred
-    except (DecisionLLMRateLimitError, DecisionLLMBudgetError, DecisionLLMGenerationError):
-        return _fallback_immediate_options(brief, options)
+    _check_budget(brief, payload, settings.question_max_tokens, settings)
+    client = AsyncGroq(
+        api_key=settings.groq_api_key.get_secret_value(), timeout=20.0, max_retries=0
+    )
+    await asyncio.sleep(settings.llm_stage_delay_seconds)
+    completion, model, inferred, content = await _complete_structured(
+        client, [settings.groq_light_model, settings.groq_light_fallback_model],
+        stage="immediate_options",
+        schema_name="immediate_decision_options",
+        response_model=ImmediateOptionSetDraft,
+        parse=parse_options,
+        messages=[
+            {"role": "system", "content": IMMEDIATE_OPTIONS_PROMPT},
+            {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
+        ],
+        temperature=0.25,
+        max_completion_tokens=settings.question_max_tokens,
+    )
+    _record_completion(brief, completion, key, content, model, settings)
+    return inferred
 
 
 RECOMMENDATION_PROMPT = """Produce a grounded recommendation from the supplied
@@ -1997,51 +1779,6 @@ def _validate_recommendation_selection(
     return draft
 
 
-def _fallback_recommendation_from_options(
-    brief: dict,
-    options: list[dict],
-    *,
-    caveat: str,
-) -> RecommendationResult | None:
-    actionable = [option for option in options if option.get("status") != "rejected"]
-    if len(actionable) < 2:
-        return None
-    selected = actionable[0]
-    selected_id = str(selected.get("id") or "")
-    selected_title = str(selected.get("title") or "the first option")
-    values = [
-        str(item.get("value") or "")
-        for item in brief.get("values", [])
-        if isinstance(item, dict) and item.get("status") != "rejected"
-    ]
-    constraints = [
-        str(item.get("value") or "")
-        for item in brief.get("constraints", [])
-        if isinstance(item, dict) and item.get("status") != "rejected"
-    ]
-    value_hint = values[0] if values else "your stated priorities"
-    constraint_hint = constraints[0] if constraints else "your practical constraints"
-    alternative = next(
-        (str(option.get("title") or "") for option in actionable[1:] if option.get("title")),
-        "the other option",
-    )
-    return RecommendationResult(
-        selected_option_id=selected_id,
-        selected_option_title=selected_title,
-        summary=(
-            f"Start with {_short_option_label(selected_title)} as a provisional choice while we stay within the current AI usage limit."
-        ),
-        concrete_example=selected_title,
-        rationale=[
-            f"It is the safest default given {value_hint}.",
-            f"It is less likely to violate {constraint_hint}.",
-        ],
-        alternate_recommendation=f"If this underperforms, switch to {_short_option_label(alternative)}.",
-        robustness="low",
-        caveat=caveat,
-    )
-
-
 async def generate_grounded_recommendation(
     brief: dict,
     options: list[dict],
@@ -2049,6 +1786,8 @@ async def generate_grounded_recommendation(
 ) -> RecommendationResult | None:
     if not settings.groq_api_key or len(options) < 2:
         return None
+    if any(not option.get("id") for option in options):
+        raise DecisionLLMGenerationError("Recommendation options must have identifiers before generation")
     confirmed_selection = _confirmed_actionable_selection(brief, options)
     payload = {
         "decision_brief": _compact_brief(brief),
@@ -2071,15 +1810,7 @@ async def generate_grounded_recommendation(
             logger.warning("Ignoring cached recommendation that no longer satisfies the output contract")
             cached = None
     if not cached:
-        try:
-            _check_budget(brief, payload, recommendation_token_limit, settings)
-        except DecisionLLMBudgetError:
-            logger.warning("Recommendation budget exhausted; using deterministic fallback recommendation")
-            return _fallback_recommendation_from_options(
-                brief,
-                options,
-                caveat="AI token budget reached for this decision, so this is a conservative provisional recommendation.",
-            )
+        _check_budget(brief, payload, recommendation_token_limit, settings)
         client = AsyncGroq(
             api_key=settings.groq_api_key.get_secret_value(), timeout=30.0, max_retries=0
         )
